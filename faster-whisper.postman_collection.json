@@ -1,0 +1,328 @@
+{
+  "info": {
+    "name": "Faster Whisper Transcription Service",
+    "description": "Async audio transcription API powered by faster-whisper + Celery + Redis.\n\nTypical flow:\n1. POST /transcribe/async  → get job_id\n2. GET  /jobs/{job_id}     → poll until status == \"done\"\n\nBase URL is stored in the `base_url` collection variable (default: http://localhost:8000).",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "http://localhost:8000",
+      "type": "string"
+    },
+    {
+      "key": "job_id",
+      "value": "",
+      "type": "string",
+      "description": "Automatically set by the 'Submit transcription job' request test script."
+    }
+  ],
+  "item": [
+    {
+      "name": "Transcription",
+      "description": "Submit an audio file and retrieve the result.",
+      "item": [
+        {
+          "name": "Submit transcription job",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/transcribe/async",
+              "host": ["{{base_url}}"],
+              "path": ["transcribe", "async"]
+            },
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": "",
+                  "description": "Audio file to transcribe (mp3, ogg, wav, flac, m4a, …). Max 200 MB by default."
+                },
+                {
+                  "key": "language",
+                  "value": "",
+                  "type": "text",
+                  "description": "Optional BCP-47 language code (e.g. 'ar', 'en', 'fr'). Leave blank for auto-detection.",
+                  "disabled": true
+                }
+              ]
+            },
+            "description": "Upload an audio file to start an async transcription job.\n\nReturns a `job_id` UUID. Use **GET /jobs/{job_id}** to poll for the result.\n\n**Notes**\n- The `language` field is optional. Omit it to let Whisper auto-detect.\n- The file is saved to the server temporarily; it is deleted once transcription finishes.\n- Results are retained in Redis for 24 hours (configurable via `JOB_RESULT_TTL_SECONDS`)."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (pm.response.code === 200) {",
+                  "    const body = pm.response.json();",
+                  "    if (body.job_id) {",
+                  "        pm.collectionVariables.set('job_id', body.job_id);",
+                  "        console.log('job_id saved:', body.job_id);",
+                  "    }",
+                  "}",
+                  "pm.test('Status 200', () => pm.response.to.have.status(200));",
+                  "pm.test('Has job_id', () => {",
+                  "    const body = pm.response.json();",
+                  "    pm.expect(body).to.have.property('job_id');",
+                  "    pm.expect(body.job_id).to.be.a('string').and.not.empty;",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "response": [
+            {
+              "name": "200 — Job created",
+              "status": "OK",
+              "code": 200,
+              "header": [{ "key": "Content-Type", "value": "application/json" }],
+              "body": "{\n  \"job_id\": \"3fa85f64-5717-4562-b3fc-2c963f66afa6\"\n}",
+              "_postman_previewlanguage": "json"
+            },
+            {
+              "name": "400 — No file provided",
+              "status": "Bad Request",
+              "code": 400,
+              "header": [{ "key": "Content-Type", "value": "application/json" }],
+              "body": "{\n  \"detail\": \"No file provided\"\n}",
+              "_postman_previewlanguage": "json"
+            },
+            {
+              "name": "413 — File too large",
+              "status": "Request Entity Too Large",
+              "code": 413,
+              "header": [{ "key": "Content-Type", "value": "application/json" }],
+              "body": "{\n  \"detail\": \"File too large (max 200MB)\"\n}",
+              "_postman_previewlanguage": "json"
+            }
+          ]
+        },
+        {
+          "name": "Get job status",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/jobs/{{job_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["jobs", "{{job_id}}"]
+            },
+            "description": "Poll the status of a transcription job.\n\nPossible `status` values:\n\n| Value | Meaning |\n|-------|---------|\n| `pending` | Queued, not yet started |\n| `running` | Worker is actively transcribing |\n| `done` | Transcription complete — `result` field is populated |\n| `failed` | Error occurred — `error` field contains the message |\n\n**Polling tip:** call every 2–5 seconds until `status` is `done` or `failed`."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.to.have.status(200));",
+                  "pm.test('Has status field', () => {",
+                  "    const body = pm.response.json();",
+                  "    pm.expect(body).to.have.property('status');",
+                  "    pm.expect(['pending','running','done','failed']).to.include(body.status);",
+                  "});",
+                  "const body = pm.response.json();",
+                  "if (body.status === 'done') {",
+                  "    pm.test('Result has language', () => pm.expect(body.result).to.have.property('language'));",
+                  "    pm.test('Result has segments', () => pm.expect(body.result.segments).to.be.an('array'));",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "response": [
+            {
+              "name": "pending",
+              "status": "OK",
+              "code": 200,
+              "header": [{ "key": "Content-Type", "value": "application/json" }],
+              "body": "{\n  \"job_id\": \"3fa85f64-5717-4562-b3fc-2c963f66afa6\",\n  \"status\": \"pending\",\n  \"estimated_wait_seconds\": 120\n}",
+              "_postman_previewlanguage": "json"
+            },
+            {
+              "name": "running",
+              "status": "OK",
+              "code": 200,
+              "header": [{ "key": "Content-Type", "value": "application/json" }],
+              "body": "{\n  \"job_id\": \"3fa85f64-5717-4562-b3fc-2c963f66afa6\",\n  \"status\": \"running\",\n  \"progress\": { \"segments_done\": 5 }\n}",
+              "_postman_previewlanguage": "json"
+            },
+            {
+              "name": "done",
+              "status": "OK",
+              "code": 200,
+              "header": [{ "key": "Content-Type", "value": "application/json" }],
+              "body": "{\n  \"job_id\": \"3fa85f64-5717-4562-b3fc-2c963f66afa6\",\n  \"status\": \"done\",\n  \"result\": {\n    \"language\": \"ar\",\n    \"language_probability\": 0.998,\n    \"duration\": 47.32,\n    \"segments\": [\n      {\n        \"start\": 0.0,\n        \"end\": 4.56,\n        \"text\": \"مرحباً بالعالم\",\n        \"words\": [\n          { \"start\": 0.0, \"end\": 1.2, \"word\": \"مرحباً\", \"probability\": 0.99 },\n          { \"start\": 1.3, \"end\": 2.1, \"word\": \"بالعالم\", \"probability\": 0.97 }\n        ]\n      }\n    ]\n  }\n}",
+              "_postman_previewlanguage": "json"
+            },
+            {
+              "name": "failed",
+              "status": "OK",
+              "code": 200,
+              "header": [{ "key": "Content-Type", "value": "application/json" }],
+              "body": "{\n  \"job_id\": \"3fa85f64-5717-4562-b3fc-2c963f66afa6\",\n  \"status\": \"failed\",\n  \"error\": \"CUDA out of memory\"\n}",
+              "_postman_previewlanguage": "json"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Health & Readiness",
+      "description": "Liveness and readiness probes. Use these for Docker/Kubernetes health checks.",
+      "item": [
+        {
+          "name": "Health check (liveness)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/health",
+              "host": ["{{base_url}}"],
+              "path": ["health"]
+            },
+            "description": "Liveness probe — always returns `200` as long as the FastAPI process is running.\n\n- `model_loaded`: `true` if at least one Celery worker responded to a ping.\n- `queue_depth`: total number of active + reserved tasks across all workers."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.to.have.status(200));",
+                  "pm.test('status is alive', () => {",
+                  "    const body = pm.response.json();",
+                  "    pm.expect(body.status).to.eql('alive');",
+                  "});",
+                  "pm.test('Has queue_depth', () => {",
+                  "    const body = pm.response.json();",
+                  "    pm.expect(body).to.have.property('queue_depth');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "response": [
+            {
+              "name": "200 — alive (worker up)",
+              "status": "OK",
+              "code": 200,
+              "header": [{ "key": "Content-Type", "value": "application/json" }],
+              "body": "{\n  \"status\": \"alive\",\n  \"model_loaded\": true,\n  \"queue_depth\": 0\n}",
+              "_postman_previewlanguage": "json"
+            },
+            {
+              "name": "200 — alive (worker down)",
+              "status": "OK",
+              "code": 200,
+              "header": [{ "key": "Content-Type", "value": "application/json" }],
+              "body": "{\n  \"status\": \"alive\",\n  \"model_loaded\": false,\n  \"queue_depth\": 0\n}",
+              "_postman_previewlanguage": "json"
+            }
+          ]
+        },
+        {
+          "name": "Readiness check",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/ready",
+              "host": ["{{base_url}}"],
+              "path": ["ready"]
+            },
+            "description": "Readiness probe — returns `200` only when a Celery worker is reachable and able to process jobs.\n\nReturns `503` if no worker responds within 2 seconds.\n\nUse this as the `readinessProbe` in Kubernetes or the `healthcheck` in Docker Compose."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status is 200 or 503', () => {",
+                  "    pm.expect([200, 503]).to.include(pm.response.code);",
+                  "});",
+                  "const body = pm.response.json();",
+                  "if (pm.response.code === 200) {",
+                  "    pm.test('status is ready', () => pm.expect(body.status).to.eql('ready'));",
+                  "} else {",
+                  "    pm.test('status is not_ready', () => pm.expect(body.status).to.eql('not_ready'));",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "response": [
+            {
+              "name": "200 — ready",
+              "status": "OK",
+              "code": 200,
+              "header": [{ "key": "Content-Type", "value": "application/json" }],
+              "body": "{\n  \"status\": \"ready\"\n}",
+              "_postman_previewlanguage": "json"
+            },
+            {
+              "name": "503 — worker unavailable",
+              "status": "Service Unavailable",
+              "code": 503,
+              "header": [{ "key": "Content-Type", "value": "application/json" }],
+              "body": "{\n  \"status\": \"not_ready\",\n  \"reason\": \"worker_not_available\"\n}",
+              "_postman_previewlanguage": "json"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Models",
+      "description": "Inspect available Whisper model sizes.",
+      "item": [
+        {
+          "name": "List available models",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/models",
+              "host": ["{{base_url}}"],
+              "path": ["models"]
+            },
+            "description": "Returns all Whisper model sizes faster-whisper supports, plus the model currently loaded by the worker (controlled by the `MODEL_SIZE` env var).\n\nModel sizes roughly ordered by speed vs accuracy:\n`tiny` → `base` → `small` → `medium` → `large-v1` → `large-v2` → `large-v3`\n\nThe `.en` variants are English-only and slightly faster for English audio."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.to.have.status(200));",
+                  "pm.test('Has available and current', () => {",
+                  "    const body = pm.response.json();",
+                  "    pm.expect(body).to.have.property('available');",
+                  "    pm.expect(body).to.have.property('current');",
+                  "    pm.expect(body.available).to.be.an('array').and.not.empty;",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "response": [
+            {
+              "name": "200 — model list",
+              "status": "OK",
+              "code": 200,
+              "header": [{ "key": "Content-Type", "value": "application/json" }],
+              "body": "{\n  \"available\": [\n    \"tiny\", \"tiny.en\",\n    \"base\", \"base.en\",\n    \"small\", \"small.en\",\n    \"medium\", \"medium.en\",\n    \"large-v1\", \"large-v2\", \"large-v3\"\n  ],\n  \"current\": \"small\"\n}",
+              "_postman_previewlanguage": "json"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

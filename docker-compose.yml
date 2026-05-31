@@ -1,0 +1,35 @@
+version: "3.9"
+
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file: .env
+    volumes:
+      - uploads:/tmp/uploads
+      - model_cache:/root/.cache/huggingface
+    depends_on:
+      - redis
+    mem_limit: 2g
+
+  worker:
+    build: .
+    command: celery -A worker worker --concurrency=1 --prefetch-multiplier=1 --loglevel=info
+    env_file: .env
+    volumes:
+      - uploads:/tmp/uploads
+      - model_cache:/root/.cache/huggingface
+    depends_on:
+      - redis
+    mem_limit: 4g
+
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redis_data:/data
+
+volumes:
+  uploads:
+  model_cache:
+  redis_data:
