@@ -15,6 +15,12 @@
       "value": "",
       "type": "string",
       "description": "Automatically set by the 'Submit transcription job' request test script."
+    },
+    {
+      "key": "last_model_size",
+      "value": "",
+      "type": "string",
+      "description": "Automatically set by the 'Submit transcription job' request test script."
     }
   ],
   "item": [
@@ -47,10 +53,17 @@
                   "type": "text",
                   "description": "Optional BCP-47 language code (e.g. 'ar', 'en', 'fr'). Leave blank for auto-detection.",
                   "disabled": true
+                },
+                {
+                  "key": "model_size",
+                  "value": "small",
+                  "type": "text",
+                  "description": "Optional. Whisper model size: tiny, base, small, medium, large-v1/v2/v3. Defaults to MODEL_SIZE env var.",
+                  "disabled": true
                 }
               ]
             },
-            "description": "Upload an audio file to start an async transcription job.\n\nReturns a `job_id` UUID. Use **GET /jobs/{job_id}** to poll for the result.\n\n**Notes**\n- The `language` field is optional. Omit it to let Whisper auto-detect.\n- The file is saved to the server temporarily; it is deleted once transcription finishes.\n- Results are retained in Redis for 24 hours (configurable via `JOB_RESULT_TTL_SECONDS`)."
+            "description": "Upload an audio file to start an async transcription job.\n\nReturns a `job_id` UUID. Use **GET /jobs/{job_id}** to poll for the result.\n\n**Notes**\n- The `language` field is optional. Omit it to let Whisper auto-detect.\n- The `model_size` field is optional. Omit it to use the default model from `MODEL_SIZE` env var.\n- The file is saved to the server temporarily; it is deleted once transcription finishes.\n- Results are retained in Redis for 24 hours (configurable via `JOB_RESULT_TTL_SECONDS`)."
           },
           "event": [
             {
@@ -65,6 +78,7 @@
                   "        console.log('job_id saved:', body.job_id);",
                   "    }",
                   "}",
+                  "pm.collectionVariables.set('last_model_size', pm.request.body.formdata.get('model_size') || 'default');",
                   "pm.test('Status 200', () => pm.response.to.have.status(200));",
                   "pm.test('Has job_id', () => {",
                   "    const body = pm.response.json();",
@@ -99,6 +113,14 @@
               "header": [{ "key": "Content-Type", "value": "application/json" }],
               "body": "{\n  \"detail\": \"File too large (max 200MB)\"\n}",
               "_postman_previewlanguage": "json"
+            },
+            {
+              "name": "400 — Unknown model_size",
+              "status": "Bad Request",
+              "code": 400,
+              "header": [{ "key": "Content-Type", "value": "application/json" }],
+              "body": "{\n  \"detail\": \"Unknown model 'fakename'. Available: ['tiny', 'base', 'small', ...]\"\n}",
+              "_postman_previewlanguage": "json"
             }
           ]
         },
@@ -127,6 +149,11 @@
                   "    pm.expect(['pending','running','done','failed']).to.include(body.status);",
                   "});",
                   "const body = pm.response.json();",
+                  "if (body.status === 'running' && body.progress) {",
+                  "    pm.test('Progress has chunks field', () => {",
+                  "        pm.expect(body.progress).to.have.property('chunks');",
+                  "    });",
+                  "}",
                   "if (body.status === 'done') {",
                   "    pm.test('Result has language', () => pm.expect(body.result).to.have.property('language'));",
                   "    pm.test('Result has segments', () => pm.expect(body.result.segments).to.be.an('array'));",
@@ -149,7 +176,7 @@
               "status": "OK",
               "code": 200,
               "header": [{ "key": "Content-Type", "value": "application/json" }],
-              "body": "{\n  \"job_id\": \"3fa85f64-5717-4562-b3fc-2c963f66afa6\",\n  \"status\": \"running\",\n  \"progress\": { \"segments_done\": 5 }\n}",
+              "body": "{\n  \"job_id\": \"3fa85f64-5717-4562-b3fc-2c963f66afa6\",\n  \"status\": \"running\",\n  \"progress\": { \"chunks\": 6, \"status\": \"transcribing_chunks\" }\n}",
               "_postman_previewlanguage": "json"
             },
             {
@@ -301,11 +328,12 @@
                 "type": "text/javascript",
                 "exec": [
                   "pm.test('Status 200', () => pm.response.to.have.status(200));",
-                  "pm.test('Has available and current', () => {",
+                  "pm.test('Has available, default, loaded', () => {",
                   "    const body = pm.response.json();",
                   "    pm.expect(body).to.have.property('available');",
-                  "    pm.expect(body).to.have.property('current');",
-                  "    pm.expect(body.available).to.be.an('array').and.not.empty;",
+                  "    pm.expect(body).to.have.property('default');",
+                  "    pm.expect(body).to.have.property('loaded');",
+                  "    pm.expect(body.loaded).to.be.an('array');",
                   "});"
                 ]
               }
@@ -317,7 +345,223 @@
               "status": "OK",
               "code": 200,
               "header": [{ "key": "Content-Type", "value": "application/json" }],
-              "body": "{\n  \"available\": [\n    \"tiny\", \"tiny.en\",\n    \"base\", \"base.en\",\n    \"small\", \"small.en\",\n    \"medium\", \"medium.en\",\n    \"large-v1\", \"large-v2\", \"large-v3\"\n  ],\n  \"current\": \"small\"\n}",
+              "body": "{\n  \"available\": [\n    \"tiny\", \"tiny.en\",\n    \"base\", \"base.en\",\n    \"small\", \"small.en\",\n    \"medium\", \"medium.en\",\n    \"large-v1\", \"large-v2\", \"large-v3\"\n  ],\n  \"default\": \"small\",\n  \"loaded\": [\"small\"]\n}",
+              "_postman_previewlanguage": "json"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "MongoDB — Transcription History",
+      "description": "Query past transcription results stored permanently in MongoDB.",
+      "item": [
+        {
+          "name": "List transcriptions",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/transcriptions?limit=20",
+              "host": ["{{base_url}}"],
+              "path": ["transcriptions"],
+              "query": [
+                { "key": "limit", "value": "20", "description": "Max items (capped at 100)" }
+              ]
+            },
+            "description": "Returns a paginated list of past transcription jobs, sorted newest first. The `segments` field is excluded for performance."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('Has total and items', () => {",
+                  "    pm.expect(body).to.have.property('total');",
+                  "    pm.expect(body).to.have.property('items');",
+                  "    pm.expect(body.items).to.be.an('array');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "response": [
+            {
+              "name": "200 — list",
+              "status": "OK",
+              "code": 200,
+              "header": [{ "key": "Content-Type", "value": "application/json" }],
+              "body": "{\n  \"total\": 42,\n  \"skip\": 0,\n  \"limit\": 20,\n  \"items\": [\n    {\n      \"job_id\": \"abc-123\",\n      \"filename\": \"recording.mp3\",\n      \"model_size\": \"small\",\n      \"language\": \"ar\",\n      \"audio_duration\": 47.32,\n      \"vad_removed_seconds\": 3.12,\n      \"processing_time_seconds\": 12.45,\n      \"chunks\": 6,\n      \"created_at\": \"2025-01-01T00:00:00Z\"\n    }\n  ]\n}",
+              "_postman_previewlanguage": "json"
+            }
+          ]
+        },
+        {
+          "name": "Transcription stats",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/transcriptions/stats",
+              "host": ["{{base_url}}"],
+              "path": ["transcriptions", "stats"]
+            },
+            "description": "Aggregated metrics across all transcription jobs."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('Has stats fields', () => {",
+                  "    pm.expect(body).to.have.property('total_jobs');",
+                  "    pm.expect(body).to.have.property('avg_processing_ratio');",
+                  "    pm.expect(body).to.have.property('by_model');",
+                  "    pm.expect(body).to.have.property('by_language');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "response": [
+            {
+              "name": "200 — stats",
+              "status": "OK",
+              "code": 200,
+              "header": [{ "key": "Content-Type", "value": "application/json" }],
+              "body": "{\n  \"total_jobs\": 42,\n  \"total_audio_hours\": 5.23,\n  \"avg_processing_ratio\": 0.45,\n  \"by_model\": { \"small\": 30, \"base\": 12 },\n  \"by_language\": { \"ar\": 25, \"en\": 17 }\n}",
+              "_postman_previewlanguage": "json"
+            }
+          ]
+        },
+        {
+          "name": "Compare jobs (model comparison)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/transcriptions/compare?job_ids={{job_id}},{{job_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["transcriptions", "compare"],
+              "query": [
+                { "key": "job_ids", "value": "{{job_id}},{{job_id}}", "description": "Comma-separated job IDs to compare" }
+              ]
+            },
+            "description": "Replace the two job_ids with IDs from the same audio transcribed with different models to compare results side by side."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('Has jobs array', () => {",
+                  "    pm.expect(body).to.have.property('jobs');",
+                  "    pm.expect(body.jobs).to.be.an('array');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "response": [
+            {
+              "name": "200 — compare",
+              "status": "OK",
+              "code": 200,
+              "header": [{ "key": "Content-Type", "value": "application/json" }],
+              "body": "{\n  \"jobs\": [\n    {\n      \"job_id\": \"abc-123\",\n      \"model_size\": \"small\",\n      \"processing_time_seconds\": 12.45\n    },\n    {\n      \"job_id\": \"def-456\",\n      \"model_size\": \"base\",\n      \"processing_time_seconds\": 8.32\n    }\n  ]\n}",
+              "_postman_previewlanguage": "json"
+            }
+          ]
+        },
+        {
+          "name": "Get full transcription",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/transcriptions/{{job_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["transcriptions", "{{job_id}}"]
+            },
+            "description": "Returns the full transcription record including `segments`, `vad_removed_seconds`, and `processing_time_seconds`.\n\nUses `{{job_id}}` which is automatically set by the 'Submit transcription job' request."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('Has transcription fields', () => {",
+                  "    pm.expect(body).to.have.property('segments');",
+                  "    pm.expect(body).to.have.property('vad_removed_seconds');",
+                  "    pm.expect(body).to.have.property('processing_time_seconds');",
+                  "    pm.expect(body.segments).to.be.an('array');",
+                  "});",
+                  "pm.test('Has chunks field', () => {",
+                  "    pm.expect(body).to.have.property('chunks');",
+                  "    pm.expect(body.chunks).to.be.a('number').and.at.least(1);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "response": [
+            {
+              "name": "200 — full record",
+              "status": "OK",
+              "code": 200,
+              "header": [{ "key": "Content-Type", "value": "application/json" }],
+              "body": "{\n  \"job_id\": \"abc-123\",\n  \"filename\": \"recording.mp3\",\n  \"model_size\": \"small\",\n  \"language\": \"ar\",\n  \"audio_duration\": 47.32,\n  \"vad_removed_seconds\": 3.12,\n  \"processing_time_seconds\": 12.45,\n  \"chunks\": 6,\n  \"segments\": [{ \"start\": 0.0, \"text\": \"مرحباً\" }],\n  \"created_at\": \"2025-01-01T00:00:00Z\"\n}",
+              "_postman_previewlanguage": "json"
+            }
+          ]
+        },
+        {
+          "name": "Get segments only",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/transcriptions/{{job_id}}/segments",
+              "host": ["{{base_url}}"],
+              "path": ["transcriptions", "{{job_id}}", "segments"]
+            },
+            "description": "Returns only the `segments` array for a completed transcription."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('Has segments', () => {",
+                  "    pm.expect(body).to.have.property('segments');",
+                  "    pm.expect(body.segments).to.be.an('array');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "response": [
+            {
+              "name": "200 — segments",
+              "status": "OK",
+              "code": 200,
+              "header": [{ "key": "Content-Type", "value": "application/json" }],
+              "body": "{\n  \"job_id\": \"abc-123\",\n  \"segments\": [\n    {\n      \"start\": 0.0,\n      \"end\": 4.56,\n      \"text\": \"مرحباً بالعالم\",\n      \"words\": []\n    }\n  ]\n}",
               "_postman_previewlanguage": "json"
             }
           ]

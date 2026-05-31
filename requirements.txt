@@ -4,3 +4,4 @@ celery[redis]>=5.4,<6
 python-multipart>=0.0,<1
 pydantic-settings>=2,<3
 faster-whisper>=1.0,<2
+pymongo>=4.6,<5

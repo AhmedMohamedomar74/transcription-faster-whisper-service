@@ -7,6 +7,8 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse
 from celery.result import AsyncResult
 
+from pymongo import MongoClient
+
 from config import settings
 from schemas import JobStatus, TranscriptionResult
 from worker import celery_app, transcribe_audio
@@ -16,6 +18,15 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 CHUNK_SIZE = 64 * 1024
+
+_mongo_client = None
+
+
+def get_mongo():
+    global _mongo_client
+    if _mongo_client is None:
+        _mongo_client = MongoClient(settings.mongo_url)
+    return _mongo_client["whisper"]["transcriptions"]
 
 
 @asynccontextmanager
@@ -54,9 +65,16 @@ def get_queue_depth():
 async def transcribe_async(
     file: UploadFile = File(...),
     language: str = Form(None),
+    model_size: str = Form(None),
 ):
     if not file.filename:
         raise HTTPException(status_code=400, detail="No file provided")
+
+    if model_size and model_size not in available_models():
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown model '{model_size}'. Available: {available_models()}",
+        )
 
     max_bytes = settings.max_file_size_mb * 1024 * 1024
     file_id = str(uuid.uuid4())
@@ -81,7 +99,7 @@ async def transcribe_async(
                 )
             f.write(chunk)
 
-    task = transcribe_audio.delay(dest, language=language)
+    task = transcribe_audio.delay(dest, language=language, model_size=model_size)
     return {"job_id": task.id}
 
 
@@ -147,8 +165,86 @@ async def ready():
 
 @app.get("/models")
 async def models():
+    from worker import _models
     all_models = available_models()
     return {
         "available": all_models,
-        "current": settings.model_size,
+        "default": settings.model_size,
+        "loaded": list(_models.keys()),
     }
+
+
+@app.get("/transcriptions")
+async def list_transcriptions(
+    limit: int = 20,
+    skip: int = 0,
+    language: str = None,
+    model_size: str = None,
+):
+    col = get_mongo()
+    query = {}
+    if language:
+        query["language"] = language
+    if model_size:
+        query["model_size"] = model_size
+    docs = list(
+        col.find(query, {"_id": 0, "segments": 0})
+           .sort("created_at", -1)
+           .skip(skip)
+           .limit(min(limit, 100))
+    )
+    total = col.count_documents(query)
+    return {"total": total, "skip": skip, "limit": limit, "items": docs}
+
+
+@app.get("/transcriptions/stats")
+async def transcription_stats():
+    col = get_mongo()
+    docs = list(col.find({}, {"_id": 0, "audio_duration": 1, "processing_time_seconds": 1, "model_size": 1, "language": 1}))
+    if not docs:
+        return {"total_jobs": 0}
+    total_audio = sum(d.get("audio_duration", 0) for d in docs)
+    total_proc = sum(d.get("processing_time_seconds", 0) for d in docs)
+    by_model = {}
+    by_language = {}
+    for d in docs:
+        by_model[d.get("model_size", "unknown")] = by_model.get(d.get("model_size", "unknown"), 0) + 1
+        by_language[d.get("language", "unknown")] = by_language.get(d.get("language", "unknown"), 0) + 1
+    return {
+        "total_jobs": len(docs),
+        "total_audio_hours": round(total_audio / 3600, 3),
+        "avg_processing_ratio": round(total_proc / total_audio, 3) if total_audio else 0,
+        "by_model": by_model,
+        "by_language": by_language,
+    }
+
+
+@app.get("/transcriptions/compare")
+async def compare_transcriptions(job_ids: str):
+    col = get_mongo()
+    ids = [j.strip() for j in job_ids.split(",") if j.strip()]
+    if not ids:
+        raise HTTPException(status_code=400, detail="Provide at least one job_id in ?job_ids=id1,id2")
+    docs = list(col.find(
+        {"job_id": {"$in": ids}},
+        {"_id": 0, "segments": 0}
+    ))
+    return {"jobs": docs}
+
+
+@app.get("/transcriptions/{job_id}")
+async def get_transcription(job_id: str):
+    col = get_mongo()
+    doc = col.find_one({"job_id": job_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Transcription not found")
+    return doc
+
+
+@app.get("/transcriptions/{job_id}/segments")
+async def get_transcription_segments(job_id: str):
+    col = get_mongo()
+    doc = col.find_one({"job_id": job_id}, {"_id": 0, "segments": 1, "job_id": 1})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Transcription not found")
+    return {"job_id": doc["job_id"], "segments": doc.get("segments", [])}
