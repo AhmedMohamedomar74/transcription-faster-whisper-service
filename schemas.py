@@ -32,6 +32,7 @@ class JobStatus(BaseModel):
     estimated_wait_seconds: Optional[int] = None
     result: Optional[TranscriptionResult] = None
     error: Optional[str] = None
+    s3_result_key: Optional[str] = None
 
 
 class TranscriptionRecord(BaseModel):
@@ -45,6 +46,8 @@ class TranscriptionRecord(BaseModel):
     duration_after_vad: float
     processing_time_seconds: float
     created_at: datetime
+    s3_result_key: Optional[str] = None
+    media_type: Optional[str] = None
 
 
 class TranscriptionStats(BaseModel):

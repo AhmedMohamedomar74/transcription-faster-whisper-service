@@ -2,6 +2,7 @@ import os
 import math
 import time
 import datetime
+import shutil
 import logging
 import subprocess
 
@@ -11,6 +12,7 @@ from celery.signals import worker_process_init
 from faster_whisper import WhisperModel, BatchedInferencePipeline
 
 from config import settings
+import s3_client
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +37,8 @@ celery_app.conf.update(
 
 @worker_process_init.connect
 def preload_model_on_startup(**kwargs):
+    os.makedirs(settings.local_processing_dir, exist_ok=True)
+    s3_client.ensure_bucket()
     get_model()
 
 
@@ -68,7 +72,8 @@ def get_model(model_size: str = None):
     return _models[size]
 
 
-def split_audio(audio_path: str, chunk_duration: int = 600, overlap: int = 5) -> list:
+def split_audio(audio_path: str, chunk_duration: int = 600, overlap: int = 5,
+                output_dir: str = None) -> list:
     probe = subprocess.run(
         [
             "ffprobe", "-v", "error",
@@ -86,7 +91,6 @@ def split_audio(audio_path: str, chunk_duration: int = 600, overlap: int = 5) ->
 
     step = chunk_duration - overlap
     n_chunks = math.ceil((total_duration - overlap) / step)
-    base = os.path.splitext(audio_path)[0]
     chunks = []
 
     logger.info(
@@ -99,7 +103,11 @@ def split_audio(audio_path: str, chunk_duration: int = 600, overlap: int = 5) ->
         duration = min(chunk_duration, total_duration - start)
         if duration <= 1.0:
             break
-        chunk_path = f"{base}_chunk{i}.wav"
+        if output_dir:
+            chunk_path = os.path.join(output_dir, f"chunk{i}.wav")
+        else:
+            base = os.path.splitext(audio_path)[0]
+            chunk_path = f"{base}_chunk{i}.wav"
         subprocess.run(
             [
                 "ffmpeg", "-y",
@@ -151,80 +159,95 @@ def _run_transcription(model, audio_path: str, language: str, offset: float = 0.
     return segments_list, info, round(time.time() - t0, 2)
 
 
-@celery_app.task(bind=True, name="transcribe_audio")
-def transcribe_audio(self, audio_path: str, language: str = None, model_size: str = None):
+@celery_app.task(bind=True, name="process_media")
+def process_media(self, job_id: str, original_filename: str = "",
+                  language: str = None, model_size: str = None,
+                  media_type: str = "audio"):
     active_size = model_size or settings.model_size
-    logger.info("Job %s: %s (language=%s, model=%s)", self.request.id, audio_path, language, active_size)
+    logger.info("Job %s: %s (language=%s, model=%s, type=%s)",
+                job_id, original_filename, language, active_size, media_type)
 
-    chunks = split_audio(audio_path, chunk_duration=settings.chunk_duration_seconds)
+    job_dir = os.path.join(settings.local_processing_dir, job_id)
+    os.makedirs(job_dir, exist_ok=True)
 
-    if len(chunks) == 1:
-        model = get_model(model_size)
-        chunk_path, _ = chunks[0]
-        segments_list, info, processing_time = _run_transcription(model, chunk_path, language)
-
-        if chunk_path != audio_path and os.path.isfile(chunk_path):
-            os.remove(chunk_path)
-        if os.path.isfile(audio_path):
-            os.remove(audio_path)
-
-        result = {
-            "language":             info.language,
-            "language_probability": info.language_probability,
-            "duration":             segments_list[-1]["end"] if segments_list else 0.0,
-            "segments":             segments_list,
-        }
-
-        try:
-            col = get_mongo()
-            col.insert_one({
-                "job_id":                  self.request.id,
-                "filename":                os.path.basename(audio_path),
-                "model_size":              active_size,
-                "language":                info.language,
-                "language_probability":    info.language_probability,
-                "audio_duration":          round(info.duration, 3),
-                "vad_removed_seconds":     round(info.duration - info.duration_after_vad, 3),
-                "duration_after_vad":      round(info.duration_after_vad, 3),
-                "processing_time_seconds": processing_time,
-                "segments":                segments_list,
-                "chunks":                  1,
-                "created_at":              datetime.datetime.utcnow(),
-            })
-        except Exception as e:
-            logger.warning("MongoDB save failed (non-fatal): %s", e)
-
-        logger.info("Done: %d segments, %.1fs", len(segments_list), result["duration"])
-        return result
-
-    logger.info("Dispatching chord of %d chunk tasks for job %s", len(chunks), self.request.id)
-
-    subtasks = [
-        transcribe_audio_chunk.s(
-            chunk_path,
-            offset=offset,
-            language=language,
-            model_size=model_size,
+    try:
+        s3_key = f"{job_id}/compressed.ogg"
+        audio_path = s3_client.download_file(
+            settings.s3_bucket, s3_key,
+            os.path.join(job_dir, "compressed.ogg"),
         )
-        for chunk_path, offset in chunks
-    ]
 
-    callback = merge_transcriptions.s(
-        job_id=self.request.id,
-        original_filename=os.path.basename(audio_path),
-        model_size=model_size,
-    )
+        chunks = split_audio(audio_path, chunk_duration=settings.chunk_duration_seconds,
+                             output_dir=job_dir)
 
-    chord(subtasks)(callback)
+        if len(chunks) == 1:
+            model = get_model(model_size)
+            chunk_path, _ = chunks[0]
+            segments_list, info, processing_time = _run_transcription(model, chunk_path, language)
 
-    if os.path.isfile(audio_path):
-        os.remove(audio_path)
+            result = {
+                "language":             info.language,
+                "language_probability": info.language_probability,
+                "duration":             segments_list[-1]["end"] if segments_list else 0.0,
+                "segments":             segments_list,
+            }
 
-    self.update_state(
-        state="STARTED",
-        meta={"progress": {"chunks": len(chunks), "status": "transcribing_chunks"}},
-    )
-    raise Ignore()
+            result_key = f"{job_id}/transcription.json"
+            s3_client.upload_json(result, settings.s3_bucket, result_key)
+
+            try:
+                col = get_mongo()
+                col.insert_one({
+                    "job_id":                  job_id,
+                    "filename":                original_filename,
+                    "model_size":              active_size,
+                    "media_type":              media_type,
+                    "language":                info.language,
+                    "language_probability":    info.language_probability,
+                    "audio_duration":          round(info.duration, 3),
+                    "vad_removed_seconds":     round(info.duration - info.duration_after_vad, 3),
+                    "duration_after_vad":      round(info.duration_after_vad, 3),
+                    "processing_time_seconds": processing_time,
+                    "s3_result_key":           result_key,
+                    "segments":                segments_list,
+                    "chunks":                  1,
+                    "created_at":              datetime.datetime.utcnow(),
+                })
+            except Exception as e:
+                logger.warning("MongoDB save failed (non-fatal): %s", e)
+
+            logger.info("Done: %d segments, %.1fs", len(segments_list), result["duration"])
+            return result
+
+        logger.info("Dispatching chord of %d chunk tasks for job %s", len(chunks), job_id)
+
+        subtasks = [
+            transcribe_audio_chunk.s(
+                chunk_path,
+                offset=offset,
+                language=language,
+                model_size=model_size,
+            )
+            for chunk_path, offset in chunks
+        ]
+
+        callback = merge_transcriptions.s(
+            job_id=job_id,
+            original_filename=original_filename,
+            model_size=model_size,
+            media_type=media_type,
+        )
+
+        chord(subtasks)(callback)
+
+        self.update_state(
+            state="STARTED",
+            meta={"progress": {"chunks": len(chunks), "status": "transcribing_chunks"}},
+        )
+        raise Ignore()
+
+    finally:
+        shutil.rmtree(job_dir, ignore_errors=True)
 
 
 @celery_app.task(bind=True, name="transcribe_audio_chunk")
@@ -252,7 +275,8 @@ def transcribe_audio_chunk(self, audio_path: str, offset: float = 0.0,
 
 @celery_app.task(name="merge_transcriptions")
 def merge_transcriptions(chunk_results: list, job_id: str,
-                          original_filename: str, model_size: str = None):
+                          original_filename: str, model_size: str = None,
+                          media_type: str = "audio"):
     active_size = model_size or settings.model_size
 
     chunk_results.sort(key=lambda r: r["offset"])
@@ -279,18 +303,23 @@ def merge_transcriptions(chunk_results: list, job_id: str,
         "segments":             merged_segments,
     }
 
+    result_key = f"{job_id}/transcription.json"
+    s3_client.upload_json(merged_result, settings.s3_bucket, result_key)
+
     try:
         col = get_mongo()
         col.insert_one({
             "job_id":                  job_id,
             "filename":                original_filename,
             "model_size":              active_size,
+            "media_type":              media_type,
             "language":                merged_result["language"],
             "language_probability":    merged_result["language_probability"],
             "audio_duration":          round(total_audio, 3),
             "vad_removed_seconds":     round(total_vad_cut, 3),
             "duration_after_vad":      round(total_audio - total_vad_cut, 3),
             "processing_time_seconds": round(total_proc, 2),
+            "s3_result_key":           result_key,
             "segments":                merged_segments,
             "chunks":                  len(chunk_results),
             "created_at":              datetime.datetime.utcnow(),

@@ -1,5 +1,8 @@
 import os
+import json
 import uuid
+import shutil
+import subprocess
 import logging
 from contextlib import asynccontextmanager
 
@@ -11,8 +14,9 @@ from pymongo import MongoClient
 
 from config import settings
 from schemas import JobStatus, TranscriptionResult
-from worker import celery_app, transcribe_audio
+from worker import celery_app, process_media
 from faster_whisper.utils import available_models
+import s3_client
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -29,15 +33,53 @@ def get_mongo():
     return _mongo_client["whisper"]["transcriptions"]
 
 
+def detect_media_type(file_path: str) -> dict:
+    result = subprocess.run(
+        ["ffprobe", "-v", "error",
+         "-show_entries", "stream=codec_type,codec_name",
+         "-of", "json", file_path],
+        capture_output=True, text=True, check=True,
+    )
+    data = json.loads(result.stdout)
+    has_video = False
+    audio_codec = None
+    for stream in data.get("streams", []):
+        if stream.get("codec_type") == "video":
+            has_video = True
+        if stream.get("codec_type") == "audio":
+            audio_codec = stream.get("codec_name")
+    return {"has_video": has_video, "audio_codec": audio_codec}
+
+
+def needs_conversion(media_info: dict, file_size: int) -> bool:
+    if media_info["has_video"]:
+        return True
+    if file_size > 10 * 1024 * 1024:
+        return True
+    if media_info.get("audio_codec") not in ("opus", "vorbis"):
+        return True
+    return False
+
+
+def prepare_audio(input_path: str, output_path: str) -> str:
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", input_path,
+         "-vn",
+         "-ar", "16000",
+         "-ac", "1",
+         "-c:a", "libopus",
+         "-b:a", "32k",
+         output_path],
+        capture_output=True, check=True,
+    )
+    return output_path
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    os.makedirs(settings.upload_dir, exist_ok=True)
-    logger.info(
-        "Starting API (model_size=%s, device=%s, compute_type=%s)",
-        settings.model_size,
-        settings.device,
-        settings.compute_type,
-    )
+    os.makedirs(settings.local_processing_dir, exist_ok=True)
+    s3_client.ensure_bucket()
+    logger.info("Starting API (model_size=%s, device=%s)", settings.model_size, settings.device)
     yield
     logger.info("Shutting down API")
 
@@ -76,31 +118,55 @@ async def transcribe_async(
             detail=f"Unknown model '{model_size}'. Available: {available_models()}",
         )
 
-    max_bytes = settings.max_file_size_mb * 1024 * 1024
-    file_id = str(uuid.uuid4())
-    ext = os.path.splitext(file.filename or "audio")[1] or ".ogg"
-    safe_name = f"{file_id}{ext}"
-    dest = os.path.join(settings.upload_dir, safe_name)
+    job_id = str(uuid.uuid4())
+    job_dir = os.path.join(settings.local_processing_dir, job_id)
+    os.makedirs(job_dir, exist_ok=True)
 
-    os.makedirs(settings.upload_dir, exist_ok=True)
-    total_read = 0
-    with open(dest, "wb") as f:
-        while True:
-            chunk = await file.read(CHUNK_SIZE)
-            if not chunk:
-                break
-            total_read += len(chunk)
-            if total_read > max_bytes:
-                f.close()
-                os.remove(dest)
-                raise HTTPException(
-                    status_code=413,
-                    detail=f"File too large (max {settings.max_file_size_mb}MB)",
-                )
-            f.write(chunk)
+    try:
+        ext = os.path.splitext(file.filename or "media")[1] or ".bin"
+        original_path = os.path.join(job_dir, f"original{ext}")
+        max_bytes = settings.max_file_size_mb * 1024 * 1024
+        total_read = 0
+        with open(original_path, "wb") as f:
+            while True:
+                chunk = await file.read(CHUNK_SIZE)
+                if not chunk:
+                    break
+                total_read += len(chunk)
+                if total_read > max_bytes:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"File too large (max {settings.max_file_size_mb}MB)",
+                    )
+                f.write(chunk)
 
-    task = transcribe_audio.delay(dest, language=language, model_size=model_size)
-    return {"job_id": task.id}
+        media_info = detect_media_type(original_path)
+
+        if needs_conversion(media_info, total_read):
+            compressed_path = os.path.join(job_dir, "compressed.ogg")
+            prepare_audio(original_path, compressed_path)
+            upload_path = compressed_path
+        else:
+            upload_path = original_path
+
+        s3_key = f"{job_id}/compressed.ogg"
+        s3_client.upload_file(upload_path, settings.s3_bucket, s3_key)
+
+        task = process_media.apply_async(
+            kwargs={
+                "job_id": job_id,
+                "original_filename": file.filename,
+                "language": language,
+                "model_size": model_size,
+                "media_type": "video" if media_info["has_video"] else "audio",
+            },
+            task_id=job_id,
+        )
+
+        return {"job_id": job_id}
+
+    finally:
+        shutil.rmtree(job_dir, ignore_errors=True)
 
 
 @app.get("/jobs/{job_id}")
@@ -129,6 +195,7 @@ async def get_job(job_id: str):
             job_id=job_id,
             status="done",
             result=result_obj,
+            s3_result_key=f"{job_id}/transcription.json",
         ).model_dump()
 
     if task.state == "FAILURE":

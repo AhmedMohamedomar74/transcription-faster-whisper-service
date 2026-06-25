@@ -1,7 +1,7 @@
 {
   "info": {
     "name": "Faster Whisper Transcription Service",
-    "description": "Async audio transcription API powered by faster-whisper + Celery + Redis.\n\nTypical flow:\n1. POST /transcribe/async  → get job_id\n2. GET  /jobs/{job_id}     → poll until status == \"done\"\n\nBase URL is stored in the `base_url` collection variable (default: http://localhost:8000).",
+    "description": "Async audio/video transcription API powered by faster-whisper + Celery + Redis + S3 (SeaweedFS).\n\nSupports video files (mp4, mkv, webm) and audio files (mp3, ogg, wav, flac, m4a, …).\nVideos and large audio files are automatically converted to compressed 16kHz OGG Opus before transcription.\nTranscription results are stored on S3 and permanently in MongoDB.\n\nTypical flow:\n1. POST /transcribe/async  → get job_id\n2. GET  /jobs/{job_id}     → poll until status == \"done\"\n\nBase URL is stored in the `base_url` collection variable (default: http://localhost:8000).",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "variable": [
@@ -45,7 +45,7 @@
                   "key": "file",
                   "type": "file",
                   "src": "",
-                  "description": "Audio file to transcribe (mp3, ogg, wav, flac, m4a, …). Max 200 MB by default."
+                  "description": "Video or audio file to transcribe (mp4, mkv, webm, mp3, ogg, wav, flac, m4a, …). Max 1GB by default."
                 },
                 {
                   "key": "language",
@@ -63,7 +63,7 @@
                 }
               ]
             },
-            "description": "Upload an audio file to start an async transcription job.\n\nReturns a `job_id` UUID. Use **GET /jobs/{job_id}** to poll for the result.\n\n**Notes**\n- The `language` field is optional. Omit it to let Whisper auto-detect.\n- The `model_size` field is optional. Omit it to use the default model from `MODEL_SIZE` env var.\n- The file is saved to the server temporarily; it is deleted once transcription finishes.\n- Results are retained in Redis for 24 hours (configurable via `JOB_RESULT_TTL_SECONDS`)."
+            "description": "Upload a video or audio file to start an async transcription job.\n\nReturns a `job_id` UUID. Use **GET /jobs/{job_id}** to poll for the result.\n\n**Notes**\n- Supports video files (mp4, mkv, webm) — automatically extracts audio.\n- Audio conversion: large files and non-opus codecs are compressed to 16kHz OGG Opus 32kbps.\n- Small OGG/Opus files (<10MB) are stored as-is, skipping conversion.\n- The file is temporarily saved, converted/compressed, uploaded to S3, then cleaned up.\n- The worker downloads the compressed audio from S3 and stores results back on S3 + MongoDB.\n- The `language` field is optional. Omit it to let Whisper auto-detect.\n- The `model_size` field is optional. Omit it to use the default model from `MODEL_SIZE` env var.\n- Results are available via **GET /jobs/{job_id}** with `s3_result_key` pointing to the S3 JSON result."
           },
           "event": [
             {
@@ -111,7 +111,7 @@
               "status": "Request Entity Too Large",
               "code": 413,
               "header": [{ "key": "Content-Type", "value": "application/json" }],
-              "body": "{\n  \"detail\": \"File too large (max 200MB)\"\n}",
+              "body": "{\n  \"detail\": \"File too large (max 1024MB)\"\n}",
               "_postman_previewlanguage": "json"
             },
             {
@@ -134,7 +134,7 @@
               "host": ["{{base_url}}"],
               "path": ["jobs", "{{job_id}}"]
             },
-            "description": "Poll the status of a transcription job.\n\nPossible `status` values:\n\n| Value | Meaning |\n|-------|---------|\n| `pending` | Queued, not yet started |\n| `running` | Worker is actively transcribing |\n| `done` | Transcription complete — `result` field is populated |\n| `failed` | Error occurred — `error` field contains the message |\n\n**Polling tip:** call every 2–5 seconds until `status` is `done` or `failed`."
+            "description": "Poll the status of a transcription job.\n\nPossible `status` values:\n\n| Value | Meaning |\n|-------|---------|\n| `pending` | Queued, not yet started |\n| `running` | Worker is actively transcribing |\n| `done` | Transcription complete — `result` field is populated, `s3_result_key` points to S3 JSON |\n| `failed` | Error occurred — `error` field contains the message |\n\n**Polling tip:** call every 2–5 seconds until `status` is `done` or `failed`."
           },
           "event": [
             {
@@ -156,8 +156,12 @@
                   "}",
                   "if (body.status === 'done') {",
                   "    pm.test('Result has language', () => pm.expect(body.result).to.have.property('language'));",
-                  "    pm.test('Result has segments', () => pm.expect(body.result.segments).to.be.an('array'));",
-                  "}"
+                    "    pm.test('Result has segments', () => pm.expect(body.result.segments).to.be.an('array'));",
+                    "    pm.test('Has s3_result_key', () => {",
+                    "        pm.expect(body).to.have.property('s3_result_key');",
+                    "        pm.expect(body.s3_result_key).to.include('/transcription.json');",
+                    "    });",
+                    "}"
                 ]
               }
             }
@@ -184,7 +188,7 @@
               "status": "OK",
               "code": 200,
               "header": [{ "key": "Content-Type", "value": "application/json" }],
-              "body": "{\n  \"job_id\": \"3fa85f64-5717-4562-b3fc-2c963f66afa6\",\n  \"status\": \"done\",\n  \"result\": {\n    \"language\": \"ar\",\n    \"language_probability\": 0.998,\n    \"duration\": 47.32,\n    \"segments\": [\n      {\n        \"start\": 0.0,\n        \"end\": 4.56,\n        \"text\": \"مرحباً بالعالم\",\n        \"words\": [\n          { \"start\": 0.0, \"end\": 1.2, \"word\": \"مرحباً\", \"probability\": 0.99 },\n          { \"start\": 1.3, \"end\": 2.1, \"word\": \"بالعالم\", \"probability\": 0.97 }\n        ]\n      }\n    ]\n  }\n}",
+              "body": "{\n  \"job_id\": \"3fa85f64-5717-4562-b3fc-2c963f66afa6\",\n  \"status\": \"done\",\n  \"s3_result_key\": \"3fa85f64-5717-4562-b3fc-2c963f66afa6/transcription.json\",\n  \"result\": {\n    \"language\": \"ar\",\n    \"language_probability\": 0.998,\n    \"duration\": 47.32,\n    \"segments\": [\n      {\n        \"start\": 0.0,\n        \"end\": 4.56,\n        \"text\": \"مرحباً بالعالم\",\n        \"words\": [\n          { \"start\": 0.0, \"end\": 1.2, \"word\": \"مرحباً\", \"probability\": 0.99 },\n          { \"start\": 1.3, \"end\": 2.1, \"word\": \"بالعالم\", \"probability\": 0.97 }\n        ]\n      }\n    ]\n  }\n}",
               "_postman_previewlanguage": "json"
             },
             {

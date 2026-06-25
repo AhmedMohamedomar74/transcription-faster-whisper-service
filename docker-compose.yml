@@ -4,14 +4,14 @@ services:
   api:
     build: .
     ports:
-      - "8000:8000"
+      - "8100:8000"
     env_file: .env
     volumes:
-      - uploads:/tmp/uploads
       - model_cache:/root/.cache/huggingface
     depends_on:
       - redis
       - mongo
+      - seaweedfs
     mem_limit: 2g
 
   worker:
@@ -21,14 +21,21 @@ services:
     environment:
       - OMP_NUM_THREADS=2
     volumes:
-      - uploads:/tmp/uploads
       - model_cache:/root/.cache/huggingface
     depends_on:
       - redis
       - mongo
-    mem_limit: 2g
-    deploy:
-      replicas: 2
+      - seaweedfs
+    mem_limit: 4g
+
+  seaweedfs:
+    image: chrislusf/seaweedfs:latest
+    command: "server -s3 -s3.port=8333 -dir=/data"
+    ports:
+      - "8333:8333"
+    volumes:
+      - /mnt/mnt2/Simple/faster-whisper/service/.seaweedfs_data:/data
+    mem_limit: 1g
 
   redis:
     image: redis:7-alpine
@@ -42,7 +49,7 @@ services:
     mem_limit: 512m
 
 volumes:
-  uploads:
+  seaweed_data:
   model_cache:
   redis_data:
   mongo_data:

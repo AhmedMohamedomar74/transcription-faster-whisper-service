@@ -5,7 +5,7 @@ class Settings(BaseSettings):
     model_size: str = "small"
     device: str = "cpu"
     compute_type: str = "int8"
-    max_file_size_mb: int = 200
+    max_file_size_mb: int = 1024
     redis_url: str = "redis://redis:6379/0"
     upload_dir: str = "/tmp/uploads"
     job_result_ttl_seconds: int = 86400
@@ -23,6 +23,14 @@ class Settings(BaseSettings):
     beam_size: int = 1
     best_of: int = 1
     batch_size: int = 4     # reduced to fit 2 workers in memory
+
+    # S3 / SeaweedFS
+    s3_endpoint_url: str = "http://seaweedfs:8333"
+    s3_access_key: str = ""
+    s3_secret_key: str = ""
+    s3_bucket: str = "transcriptions"
+    s3_region: str = "us-east-1"
+    local_processing_dir: str = "/tmp/processing"
 
 
 settings = Settings()

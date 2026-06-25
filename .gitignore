@@ -32,3 +32,4 @@ htmlcov/
 .idea/
 .vscode/
 *.swp
+.seaweedfs_data
