@@ -26,11 +26,13 @@ class Settings(BaseSettings):
 
     # S3 / SeaweedFS
     s3_endpoint_url: str = "http://seaweedfs:8333"
+    s3_public_endpoint_url: str = "http://localhost:8333"
     s3_access_key: str = ""
     s3_secret_key: str = ""
     s3_bucket: str = "transcriptions"
     s3_region: str = "us-east-1"
     local_processing_dir: str = "/tmp/processing"
+    presigned_url_expiration_seconds: int = 3600
 
 
 settings = Settings()

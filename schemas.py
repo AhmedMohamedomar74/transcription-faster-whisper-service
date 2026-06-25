@@ -50,6 +50,25 @@ class TranscriptionRecord(BaseModel):
     media_type: Optional[str] = None
 
 
+class UploadRequest(BaseModel):
+    filename: str
+
+
+class UploadResponse(BaseModel):
+    job_id: str
+    s3_key: str
+    presigned_url: str
+    expires_in: int
+
+
+class TranscribeRequest(BaseModel):
+    job_id: str
+    s3_key: str
+    filename: str
+    language: Optional[str] = None
+    model_size: Optional[str] = None
+
+
 class TranscriptionStats(BaseModel):
     total_jobs: int
     total_audio_hours: float

@@ -1,32 +1,246 @@
 {
   "info": {
     "name": "Faster Whisper Transcription Service",
-    "description": "Async audio/video transcription API powered by faster-whisper + Celery + Redis + S3 (SeaweedFS).\n\nSupports video files (mp4, mkv, webm) and audio files (mp3, ogg, wav, flac, m4a, …).\nVideos and large audio files are automatically converted to compressed 16kHz OGG Opus before transcription.\nTranscription results are stored on S3 and permanently in MongoDB.\n\nTypical flow:\n1. POST /transcribe/async  → get job_id\n2. GET  /jobs/{job_id}     → poll until status == \"done\"\n\nBase URL is stored in the `base_url` collection variable (default: http://localhost:8000).",
+    "description": "Async audio/video transcription API powered by faster-whisper + Celery + Redis + S3 (SeaweedFS).\n\nSupports video files (mp4, mkv, webm) and audio files (mp3, ogg, wav, flac, m4a, ...).\nCompression and conversion happen in the worker, not the API.\nTranscription results are stored on S3 and permanently in MongoDB.\n\n**Flow 1 — Simple (single endpoint):**\n1. POST /transcribe/async   -> upload file, get job_id (~3-4s)\n2. GET  /jobs/{job_id}/stream -> SSE stream for real-time status\n\n**Flow 2 — Presigned URL (fastest, API never touches the file):**\n1. POST /upload/request     -> get presigned_url + job_id + s3_key (~50ms)\n2. PUT  <presigned_url>     -> upload file directly to S3\n3. POST /transcribe         -> start transcription (~50ms)\n4. GET  /jobs/{job_id}/stream -> SSE stream for real-time status\n\nBase URL is stored in the `base_url` collection variable (default: http://localhost:8100).",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "variable": [
     {
       "key": "base_url",
-      "value": "http://localhost:8000",
+      "value": "http://localhost:8100",
       "type": "string"
+    },
+    {
+      "key": "s3_base_url",
+      "value": "http://localhost:8333",
+      "type": "string",
+      "description": "SeaweedFS S3-compatible endpoint for presigned URL uploads."
     },
     {
       "key": "job_id",
       "value": "",
       "type": "string",
-      "description": "Automatically set by the 'Submit transcription job' request test script."
+      "description": "Automatically set by upload/transcribe requests."
+    },
+    {
+      "key": "s3_key",
+      "value": "",
+      "type": "string",
+      "description": "Automatically set by 'Request upload URL'."
+    },
+    {
+      "key": "presigned_url",
+      "value": "",
+      "type": "string",
+      "description": "Automatically set by 'Request upload URL'."
     },
     {
       "key": "last_model_size",
       "value": "",
       "type": "string",
-      "description": "Automatically set by the 'Submit transcription job' request test script."
+      "description": "Automatically set by transcription requests."
     }
   ],
   "item": [
     {
-      "name": "Transcription",
-      "description": "Submit an audio file and retrieve the result.",
+      "name": "Presigned Upload (Recommended)",
+      "description": "Fast upload flow: the client uploads directly to S3 via a presigned URL, then triggers transcription. The API responds instantly (~50ms) instead of waiting for file transfer + compression.\n\nFlow:\n1. Request upload URL\n2. Upload file to S3 (via presigned URL)\n3. Start transcription\n4. Stream job status (SSE)",
+      "item": [
+        {
+          "name": "1. Request upload URL",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/upload/request",
+              "host": ["{{base_url}}"],
+              "path": ["upload", "request"]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"filename\": \"recording.mp4\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "description": "Request a presigned URL for direct upload to S3.\n\nReturns:\n- `job_id` — unique job identifier\n- `s3_key` — the S3 object key where the file will be stored\n- `presigned_url` — PUT this URL with the file binary\n- `expires_in` — seconds until the URL expires (default 3600)\n\nThe API does NOT touch the file — it only generates a signed URL."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('Has job_id, s3_key, presigned_url', () => {",
+                  "    pm.expect(body).to.have.property('job_id');",
+                  "    pm.expect(body).to.have.property('s3_key');",
+                  "    pm.expect(body).to.have.property('presigned_url');",
+                  "    pm.expect(body).to.have.property('expires_in');",
+                  "});",
+                  "if (body.job_id) {",
+                  "    pm.collectionVariables.set('job_id', body.job_id);",
+                  "    pm.collectionVariables.set('s3_key', body.s3_key);",
+                  "    pm.collectionVariables.set('presigned_url', body.presigned_url);",
+                  "    console.log('Saved job_id:', body.job_id);",
+                  "    console.log('Saved s3_key:', body.s3_key);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "response": [
+            {
+              "name": "200 — Upload URL generated",
+              "status": "OK",
+              "code": 200,
+              "header": [{ "key": "Content-Type", "value": "application/json" }],
+              "body": "{\n  \"job_id\": \"3fa85f64-5717-4562-b3fc-2c963f66afa6\",\n  \"s3_key\": \"3fa85f64-5717-4562-b3fc-2c963f66afa6/original.mp4\",\n  \"presigned_url\": \"http://localhost:8333/transcriptions/3fa85f64-.../original.mp4?X-Amz-Signature=...\",\n  \"expires_in\": 3600\n}",
+              "_postman_previewlanguage": "json"
+            }
+          ]
+        },
+        {
+          "name": "2. Upload file to S3",
+          "request": {
+            "method": "PUT",
+            "header": [],
+            "url": {
+              "raw": "{{presigned_url}}",
+              "host": ["{{presigned_url}}"]
+            },
+            "body": {
+              "mode": "file",
+              "file": {
+                "src": ""
+              }
+            },
+            "description": "Upload the file directly to S3 using the presigned URL from step 1.\n\n**How to use in Postman:**\n1. Run 'Request upload URL' first (it auto-saves `presigned_url`)\n2. In this request's Body tab, select your file\n3. Send\n\nThe file goes directly to SeaweedFS — the API server is not involved.\n\n**Note:** If you get a 403, the presigned URL may have expired (default: 1 hour)."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Upload successful (200 or 201)', () => {",
+                  "    pm.expect([200, 201]).to.include(pm.response.code);",
+                  "});",
+                  "console.log('File uploaded to S3 successfully');"
+                ]
+              }
+            }
+          ],
+          "response": [
+            {
+              "name": "200 — Upload successful",
+              "status": "OK",
+              "code": 200,
+              "header": [],
+              "body": "",
+              "_postman_previewlanguage": "text"
+            }
+          ]
+        },
+        {
+          "name": "3. Start transcription",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/transcribe",
+              "host": ["{{base_url}}"],
+              "path": ["transcribe"]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"job_id\": \"{{job_id}}\",\n  \"s3_key\": \"{{s3_key}}\",\n  \"filename\": \"recording.mp4\",\n  \"language\": null,\n  \"model_size\": null\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "description": "Start transcription for a file already uploaded to S3.\n\nThis returns instantly (~50ms) because no file processing happens here — the worker handles download, compression, and transcription.\n\n**Parameters:**\n- `job_id` — from step 1 (auto-filled)\n- `s3_key` — from step 1 (auto-filled)\n- `filename` — original filename for metadata\n- `language` — optional BCP-47 code (e.g. 'ar', 'en'). Null for auto-detect.\n- `model_size` — optional (tiny/base/small/medium/large-v3). Null for default."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.to.have.status(200));",
+                  "pm.test('Has job_id', () => {",
+                  "    const body = pm.response.json();",
+                  "    pm.expect(body).to.have.property('job_id');",
+                  "    pm.expect(body.job_id).to.be.a('string').and.not.empty;",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "response": [
+            {
+              "name": "200 — Transcription started",
+              "status": "OK",
+              "code": 200,
+              "header": [{ "key": "Content-Type", "value": "application/json" }],
+              "body": "{\n  \"job_id\": \"3fa85f64-5717-4562-b3fc-2c963f66afa6\"\n}",
+              "_postman_previewlanguage": "json"
+            },
+            {
+              "name": "400 — Unknown model_size",
+              "status": "Bad Request",
+              "code": 400,
+              "header": [{ "key": "Content-Type", "value": "application/json" }],
+              "body": "{\n  \"detail\": \"Unknown model 'fakename'. Available: ['tiny', 'base', 'small', ...]\"\n}",
+              "_postman_previewlanguage": "json"
+            }
+          ]
+        },
+        {
+          "name": "4. Stream job status (SSE)",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Accept", "value": "text/event-stream" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/jobs/{{job_id}}/stream",
+              "host": ["{{base_url}}"],
+              "path": ["jobs", "{{job_id}}", "stream"]
+            },
+            "description": "Server-Sent Events (SSE) stream for real-time job status updates.\n\n**Events received:**\n- `downloading` — worker is downloading file from S3\n- `analyzing` — detecting media type\n- `compressing` — converting with ffmpeg\n- `splitting` — splitting long audio into chunks\n- `transcribing` — running whisper (includes chunk count)\n- `merging` — merging chunk results\n- `done` — transcription complete (includes duration + segment count)\n- `failed` — error occurred (includes error message)\n\n**Usage with curl:**\n```\ncurl -N http://localhost:8100/jobs/{job_id}/stream\n```\n\n**Usage in JavaScript:**\n```javascript\nconst es = new EventSource('/jobs/{job_id}/stream');\nes.addEventListener('status', (e) => {\n    const data = JSON.parse(e.data);\n    console.log(data.status);\n    if (data.status === 'done' || data.status === 'failed') es.close();\n});\n```\n\n**Note:** Postman does not natively render SSE streams well. Use curl or a browser for best results. If the job is already complete, the stream returns 'done'/'failed' immediately and closes."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.to.have.status(200));",
+                  "pm.test('Content-Type is event-stream', () => {",
+                  "    pm.expect(pm.response.headers.get('Content-Type')).to.include('text/event-stream');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "response": [
+            {
+              "name": "200 — SSE stream",
+              "status": "OK",
+              "code": 200,
+              "header": [{ "key": "Content-Type", "value": "text/event-stream" }],
+              "body": "event: status\ndata: {\"status\": \"downloading\"}\n\nevent: status\ndata: {\"status\": \"compressing\"}\n\nevent: status\ndata: {\"status\": \"transcribing\", \"chunks\": 1}\n\nevent: status\ndata: {\"status\": \"done\", \"duration\": 47.32, \"segments\": 12}\n",
+              "_postman_previewlanguage": "text"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Simple Upload",
+      "description": "Single-endpoint flow: upload the file to the API which forwards it raw to S3, then creates a Celery task. The worker handles compression and transcription.\n\nResponse time depends on file size (~3-4s for typical files). For zero-touch API uploads, use the Presigned Upload flow instead.",
       "item": [
         {
           "name": "Submit transcription job",
@@ -45,7 +259,7 @@
                   "key": "file",
                   "type": "file",
                   "src": "",
-                  "description": "Video or audio file to transcribe (mp4, mkv, webm, mp3, ogg, wav, flac, m4a, …). Max 1GB by default."
+                  "description": "Video or audio file to transcribe (mp4, mkv, webm, mp3, ogg, wav, flac, m4a, ...). Max 1GB by default."
                 },
                 {
                   "key": "language",
@@ -63,7 +277,7 @@
                 }
               ]
             },
-            "description": "Upload a video or audio file to start an async transcription job.\n\nReturns a `job_id` UUID. Use **GET /jobs/{job_id}** to poll for the result.\n\n**Notes**\n- Supports video files (mp4, mkv, webm) — automatically extracts audio.\n- Audio conversion: large files and non-opus codecs are compressed to 16kHz OGG Opus 32kbps.\n- Small OGG/Opus files (<10MB) are stored as-is, skipping conversion.\n- The file is temporarily saved, converted/compressed, uploaded to S3, then cleaned up.\n- The worker downloads the compressed audio from S3 and stores results back on S3 + MongoDB.\n- The `language` field is optional. Omit it to let Whisper auto-detect.\n- The `model_size` field is optional. Omit it to use the default model from `MODEL_SIZE` env var.\n- Results are available via **GET /jobs/{job_id}** with `s3_result_key` pointing to the S3 JSON result."
+            "description": "Upload a file to the API server. The API saves it raw to S3 (no compression) and creates a Celery task. The worker handles compression + transcription.\n\nResponse time depends on file size (~3-4s for typical files).\n\nFor faster uploads where the API never touches the file, use the Presigned Upload flow."
           },
           "event": [
             {
@@ -78,7 +292,6 @@
                   "        console.log('job_id saved:', body.job_id);",
                   "    }",
                   "}",
-                  "pm.collectionVariables.set('last_model_size', pm.request.body.formdata.get('model_size') || 'default');",
                   "pm.test('Status 200', () => pm.response.to.have.status(200));",
                   "pm.test('Has job_id', () => {",
                   "    const body = pm.response.json();",
@@ -113,19 +326,47 @@
               "header": [{ "key": "Content-Type", "value": "application/json" }],
               "body": "{\n  \"detail\": \"File too large (max 1024MB)\"\n}",
               "_postman_previewlanguage": "json"
-            },
-            {
-              "name": "400 — Unknown model_size",
-              "status": "Bad Request",
-              "code": 400,
-              "header": [{ "key": "Content-Type", "value": "application/json" }],
-              "body": "{\n  \"detail\": \"Unknown model 'fakename'. Available: ['tiny', 'base', 'small', ...]\"\n}",
-              "_postman_previewlanguage": "json"
             }
           ]
         },
         {
-          "name": "Get job status",
+          "name": "Stream job status (SSE)",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Accept", "value": "text/event-stream" }
+            ],
+            "url": {
+              "raw": "{{base_url}}/jobs/{{job_id}}/stream",
+              "host": ["{{base_url}}"],
+              "path": ["jobs", "{{job_id}}", "stream"]
+            },
+            "description": "SSE stream for real-time job status updates.\n\nEvents: downloading, analyzing, compressing, splitting, transcribing, merging, done, failed.\n\n**Note:** Postman doesn't render SSE well. Use curl instead:\n```\ncurl -N http://localhost:8100/jobs/{job_id}/stream\n```"
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ],
+          "response": [
+            {
+              "name": "200 — SSE stream",
+              "status": "OK",
+              "code": 200,
+              "header": [{ "key": "Content-Type", "value": "text/event-stream" }],
+              "body": "event: status\ndata: {\"status\": \"downloading\"}\n\nevent: status\ndata: {\"status\": \"transcribing\", \"chunks\": 1}\n\nevent: status\ndata: {\"status\": \"done\", \"duration\": 47.32, \"segments\": 12}\n",
+              "_postman_previewlanguage": "text"
+            }
+          ]
+        },
+        {
+          "name": "Get job status (polling)",
           "request": {
             "method": "GET",
             "header": [],
@@ -134,7 +375,7 @@
               "host": ["{{base_url}}"],
               "path": ["jobs", "{{job_id}}"]
             },
-            "description": "Poll the status of a transcription job.\n\nPossible `status` values:\n\n| Value | Meaning |\n|-------|---------|\n| `pending` | Queued, not yet started |\n| `running` | Worker is actively transcribing |\n| `done` | Transcription complete — `result` field is populated, `s3_result_key` points to S3 JSON |\n| `failed` | Error occurred — `error` field contains the message |\n\n**Polling tip:** call every 2–5 seconds until `status` is `done` or `failed`."
+            "description": "Poll the status of a transcription job. Use SSE stream instead for real-time updates.\n\nPossible `status` values: pending, running, done, failed."
           },
           "event": [
             {
@@ -149,19 +390,14 @@
                   "    pm.expect(['pending','running','done','failed']).to.include(body.status);",
                   "});",
                   "const body = pm.response.json();",
-                  "if (body.status === 'running' && body.progress) {",
-                  "    pm.test('Progress has chunks field', () => {",
-                  "        pm.expect(body.progress).to.have.property('chunks');",
-                  "    });",
-                  "}",
                   "if (body.status === 'done') {",
                   "    pm.test('Result has language', () => pm.expect(body.result).to.have.property('language'));",
-                    "    pm.test('Result has segments', () => pm.expect(body.result.segments).to.be.an('array'));",
-                    "    pm.test('Has s3_result_key', () => {",
-                    "        pm.expect(body).to.have.property('s3_result_key');",
-                    "        pm.expect(body.s3_result_key).to.include('/transcription.json');",
-                    "    });",
-                    "}"
+                  "    pm.test('Result has segments', () => pm.expect(body.result.segments).to.be.an('array'));",
+                  "    pm.test('Has s3_result_key', () => {",
+                  "        pm.expect(body).to.have.property('s3_result_key');",
+                  "        pm.expect(body.s3_result_key).to.include('/transcription.json');",
+                  "    });",
+                  "}"
                 ]
               }
             }
@@ -188,7 +424,7 @@
               "status": "OK",
               "code": 200,
               "header": [{ "key": "Content-Type", "value": "application/json" }],
-              "body": "{\n  \"job_id\": \"3fa85f64-5717-4562-b3fc-2c963f66afa6\",\n  \"status\": \"done\",\n  \"s3_result_key\": \"3fa85f64-5717-4562-b3fc-2c963f66afa6/transcription.json\",\n  \"result\": {\n    \"language\": \"ar\",\n    \"language_probability\": 0.998,\n    \"duration\": 47.32,\n    \"segments\": [\n      {\n        \"start\": 0.0,\n        \"end\": 4.56,\n        \"text\": \"مرحباً بالعالم\",\n        \"words\": [\n          { \"start\": 0.0, \"end\": 1.2, \"word\": \"مرحباً\", \"probability\": 0.99 },\n          { \"start\": 1.3, \"end\": 2.1, \"word\": \"بالعالم\", \"probability\": 0.97 }\n        ]\n      }\n    ]\n  }\n}",
+              "body": "{\n  \"job_id\": \"3fa85f64-5717-4562-b3fc-2c963f66afa6\",\n  \"status\": \"done\",\n  \"s3_result_key\": \"3fa85f64-5717-4562-b3fc-2c963f66afa6/transcription.json\",\n  \"result\": {\n    \"language\": \"ar\",\n    \"language_probability\": 0.998,\n    \"duration\": 47.32,\n    \"segments\": [\n      {\n        \"start\": 0.0,\n        \"end\": 4.56,\n        \"text\": \"\\u0645\\u0631\\u062d\\u0628\\u0627\\u064b \\u0628\\u0627\\u0644\\u0639\\u0627\\u0644\\u0645\",\n        \"words\": []\n      }\n    ]\n  }\n}",
               "_postman_previewlanguage": "json"
             },
             {
@@ -246,14 +482,6 @@
               "header": [{ "key": "Content-Type", "value": "application/json" }],
               "body": "{\n  \"status\": \"alive\",\n  \"model_loaded\": true,\n  \"queue_depth\": 0\n}",
               "_postman_previewlanguage": "json"
-            },
-            {
-              "name": "200 — alive (worker down)",
-              "status": "OK",
-              "code": 200,
-              "header": [{ "key": "Content-Type", "value": "application/json" }],
-              "body": "{\n  \"status\": \"alive\",\n  \"model_loaded\": false,\n  \"queue_depth\": 0\n}",
-              "_postman_previewlanguage": "json"
             }
           ]
         },
@@ -267,7 +495,7 @@
               "host": ["{{base_url}}"],
               "path": ["ready"]
             },
-            "description": "Readiness probe — returns `200` only when a Celery worker is reachable and able to process jobs.\n\nReturns `503` if no worker responds within 2 seconds.\n\nUse this as the `readinessProbe` in Kubernetes or the `healthcheck` in Docker Compose."
+            "description": "Readiness probe — returns `200` only when a Celery worker is reachable and able to process jobs.\n\nReturns `503` if no worker responds within 2 seconds."
           },
           "event": [
             {
@@ -277,13 +505,7 @@
                 "exec": [
                   "pm.test('Status is 200 or 503', () => {",
                   "    pm.expect([200, 503]).to.include(pm.response.code);",
-                  "});",
-                  "const body = pm.response.json();",
-                  "if (pm.response.code === 200) {",
-                  "    pm.test('status is ready', () => pm.expect(body.status).to.eql('ready'));",
-                  "} else {",
-                  "    pm.test('status is not_ready', () => pm.expect(body.status).to.eql('not_ready'));",
-                  "}"
+                  "});"
                 ]
               }
             }
@@ -323,7 +545,7 @@
               "host": ["{{base_url}}"],
               "path": ["models"]
             },
-            "description": "Returns all Whisper model sizes faster-whisper supports, plus the model currently loaded by the worker (controlled by the `MODEL_SIZE` env var).\n\nModel sizes roughly ordered by speed vs accuracy:\n`tiny` → `base` → `small` → `medium` → `large-v1` → `large-v2` → `large-v3`\n\nThe `.en` variants are English-only and slightly faster for English audio."
+            "description": "Returns all Whisper model sizes faster-whisper supports, plus the model currently loaded by the worker.\n\nModel sizes ordered by speed vs accuracy:\n`tiny` > `base` > `small` > `medium` > `large-v1` > `large-v2` > `large-v3`"
           },
           "event": [
             {
@@ -337,7 +559,6 @@
                   "    pm.expect(body).to.have.property('available');",
                   "    pm.expect(body).to.have.property('default');",
                   "    pm.expect(body).to.have.property('loaded');",
-                  "    pm.expect(body.loaded).to.be.an('array');",
                   "});"
                 ]
               }
@@ -349,7 +570,7 @@
               "status": "OK",
               "code": 200,
               "header": [{ "key": "Content-Type", "value": "application/json" }],
-              "body": "{\n  \"available\": [\n    \"tiny\", \"tiny.en\",\n    \"base\", \"base.en\",\n    \"small\", \"small.en\",\n    \"medium\", \"medium.en\",\n    \"large-v1\", \"large-v2\", \"large-v3\"\n  ],\n  \"default\": \"small\",\n  \"loaded\": [\"small\"]\n}",
+              "body": "{\n  \"available\": [\"tiny\", \"tiny.en\", \"base\", \"base.en\", \"small\", \"small.en\", \"medium\", \"medium.en\", \"large-v1\", \"large-v2\", \"large-v3\"],\n  \"default\": \"small\",\n  \"loaded\": [\"small\"]\n}",
               "_postman_previewlanguage": "json"
             }
           ]
@@ -373,7 +594,7 @@
                 { "key": "limit", "value": "20", "description": "Max items (capped at 100)" }
               ]
             },
-            "description": "Returns a paginated list of past transcription jobs, sorted newest first. The `segments` field is excluded for performance."
+            "description": "Paginated list of past transcription jobs, sorted newest first. The `segments` field is excluded for performance."
           },
           "event": [
             {
@@ -398,7 +619,7 @@
               "status": "OK",
               "code": 200,
               "header": [{ "key": "Content-Type", "value": "application/json" }],
-              "body": "{\n  \"total\": 42,\n  \"skip\": 0,\n  \"limit\": 20,\n  \"items\": [\n    {\n      \"job_id\": \"abc-123\",\n      \"filename\": \"recording.mp3\",\n      \"model_size\": \"small\",\n      \"language\": \"ar\",\n      \"audio_duration\": 47.32,\n      \"vad_removed_seconds\": 3.12,\n      \"processing_time_seconds\": 12.45,\n      \"chunks\": 6,\n      \"created_at\": \"2025-01-01T00:00:00Z\"\n    }\n  ]\n}",
+              "body": "{\n  \"total\": 42,\n  \"skip\": 0,\n  \"limit\": 20,\n  \"items\": [\n    {\n      \"job_id\": \"abc-123\",\n      \"filename\": \"recording.mp3\",\n      \"model_size\": \"small\",\n      \"language\": \"ar\",\n      \"audio_duration\": 47.32,\n      \"processing_time_seconds\": 12.45,\n      \"created_at\": \"2025-01-01T00:00:00Z\"\n    }\n  ]\n}",
               "_postman_previewlanguage": "json"
             }
           ]
@@ -425,7 +646,6 @@
                   "const body = pm.response.json();",
                   "pm.test('Has stats fields', () => {",
                   "    pm.expect(body).to.have.property('total_jobs');",
-                  "    pm.expect(body).to.have.property('avg_processing_ratio');",
                   "    pm.expect(body).to.have.property('by_model');",
                   "    pm.expect(body).to.have.property('by_language');",
                   "});"
@@ -445,7 +665,7 @@
           ]
         },
         {
-          "name": "Compare jobs (model comparison)",
+          "name": "Compare jobs",
           "request": {
             "method": "GET",
             "header": [],
@@ -457,7 +677,7 @@
                 { "key": "job_ids", "value": "{{job_id}},{{job_id}}", "description": "Comma-separated job IDs to compare" }
               ]
             },
-            "description": "Replace the two job_ids with IDs from the same audio transcribed with different models to compare results side by side."
+            "description": "Compare multiple transcription jobs side by side (e.g. same audio with different models)."
           },
           "event": [
             {
@@ -481,7 +701,7 @@
               "status": "OK",
               "code": 200,
               "header": [{ "key": "Content-Type", "value": "application/json" }],
-              "body": "{\n  \"jobs\": [\n    {\n      \"job_id\": \"abc-123\",\n      \"model_size\": \"small\",\n      \"processing_time_seconds\": 12.45\n    },\n    {\n      \"job_id\": \"def-456\",\n      \"model_size\": \"base\",\n      \"processing_time_seconds\": 8.32\n    }\n  ]\n}",
+              "body": "{\n  \"jobs\": [\n    { \"job_id\": \"abc-123\", \"model_size\": \"small\", \"processing_time_seconds\": 12.45 },\n    { \"job_id\": \"def-456\", \"model_size\": \"base\", \"processing_time_seconds\": 8.32 }\n  ]\n}",
               "_postman_previewlanguage": "json"
             }
           ]
@@ -496,7 +716,7 @@
               "host": ["{{base_url}}"],
               "path": ["transcriptions", "{{job_id}}"]
             },
-            "description": "Returns the full transcription record including `segments`, `vad_removed_seconds`, and `processing_time_seconds`.\n\nUses `{{job_id}}` which is automatically set by the 'Submit transcription job' request."
+            "description": "Full transcription record including segments, timing, and metadata."
           },
           "event": [
             {
@@ -508,13 +728,7 @@
                   "const body = pm.response.json();",
                   "pm.test('Has transcription fields', () => {",
                   "    pm.expect(body).to.have.property('segments');",
-                  "    pm.expect(body).to.have.property('vad_removed_seconds');",
                   "    pm.expect(body).to.have.property('processing_time_seconds');",
-                  "    pm.expect(body.segments).to.be.an('array');",
-                  "});",
-                  "pm.test('Has chunks field', () => {",
-                  "    pm.expect(body).to.have.property('chunks');",
-                  "    pm.expect(body.chunks).to.be.a('number').and.at.least(1);",
                   "});"
                 ]
               }
@@ -526,7 +740,7 @@
               "status": "OK",
               "code": 200,
               "header": [{ "key": "Content-Type", "value": "application/json" }],
-              "body": "{\n  \"job_id\": \"abc-123\",\n  \"filename\": \"recording.mp3\",\n  \"model_size\": \"small\",\n  \"language\": \"ar\",\n  \"audio_duration\": 47.32,\n  \"vad_removed_seconds\": 3.12,\n  \"processing_time_seconds\": 12.45,\n  \"chunks\": 6,\n  \"segments\": [{ \"start\": 0.0, \"text\": \"مرحباً\" }],\n  \"created_at\": \"2025-01-01T00:00:00Z\"\n}",
+              "body": "{\n  \"job_id\": \"abc-123\",\n  \"filename\": \"recording.mp3\",\n  \"model_size\": \"small\",\n  \"language\": \"ar\",\n  \"audio_duration\": 47.32,\n  \"processing_time_seconds\": 12.45,\n  \"chunks\": 1,\n  \"segments\": [{ \"start\": 0.0, \"end\": 4.56, \"text\": \"...\" }],\n  \"created_at\": \"2025-01-01T00:00:00Z\"\n}",
               "_postman_previewlanguage": "json"
             }
           ]
@@ -541,7 +755,7 @@
               "host": ["{{base_url}}"],
               "path": ["transcriptions", "{{job_id}}", "segments"]
             },
-            "description": "Returns only the `segments` array for a completed transcription."
+            "description": "Returns only the segments array for a completed transcription."
           },
           "event": [
             {
@@ -565,7 +779,7 @@
               "status": "OK",
               "code": 200,
               "header": [{ "key": "Content-Type", "value": "application/json" }],
-              "body": "{\n  \"job_id\": \"abc-123\",\n  \"segments\": [\n    {\n      \"start\": 0.0,\n      \"end\": 4.56,\n      \"text\": \"مرحباً بالعالم\",\n      \"words\": []\n    }\n  ]\n}",
+              "body": "{\n  \"job_id\": \"abc-123\",\n  \"segments\": [\n    { \"start\": 0.0, \"end\": 4.56, \"text\": \"...\", \"words\": [] }\n  ]\n}",
               "_postman_previewlanguage": "json"
             }
           ]

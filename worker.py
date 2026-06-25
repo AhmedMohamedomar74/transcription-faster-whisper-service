@@ -3,6 +3,7 @@ import math
 import time
 import datetime
 import shutil
+import traceback
 import logging
 import subprocess
 
@@ -13,6 +14,8 @@ from faster_whisper import WhisperModel, BatchedInferencePipeline
 
 from config import settings
 import s3_client
+import redis_pubsub
+from audio_utils import detect_media_type, needs_conversion, prepare_audio
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +73,36 @@ def get_model(model_size: str = None):
         _models[size] = BatchedInferencePipeline(model=base)
         logger.info("Model ready: %s (batch_size=%d)", size, settings.batch_size)
     return _models[size]
+
+
+def _save_error_report(job_id, error, filename="", model_size=""):
+    error_report = {
+        "job_id": job_id,
+        "error": str(error),
+        "traceback": traceback.format_exc(),
+        "filename": filename,
+        "model_size": model_size or settings.model_size,
+        "failed_at": datetime.datetime.utcnow().isoformat(),
+    }
+    try:
+        s3_client.upload_json(error_report, settings.s3_bucket, f"{job_id}/error.json")
+    except Exception as e:
+        logger.error("Failed to save error report to S3: %s", e)
+    try:
+        get_mongo().update_one(
+            {"job_id": job_id},
+            {"$set": {
+                "job_id": job_id,
+                "filename": filename,
+                "model_size": model_size or settings.model_size,
+                "error": str(error),
+                "traceback": traceback.format_exc(),
+                "failed_at": datetime.datetime.utcnow().isoformat(),
+            }},
+            upsert=True,
+        )
+    except Exception as e:
+        logger.error("Failed to save error report to MongoDB: %s", e)
 
 
 def split_audio(audio_path: str, chunk_duration: int = 600, overlap: int = 5,
@@ -162,25 +195,56 @@ def _run_transcription(model, audio_path: str, language: str, offset: float = 0.
 @celery_app.task(bind=True, name="process_media")
 def process_media(self, job_id: str, original_filename: str = "",
                   language: str = None, model_size: str = None,
-                  media_type: str = "audio"):
+                  media_type: str = "audio", s3_key: str = None):
     active_size = model_size or settings.model_size
-    logger.info("Job %s: %s (language=%s, model=%s, type=%s)",
-                job_id, original_filename, language, active_size, media_type)
+    logger.info("Job %s: %s (language=%s, model=%s, type=%s, s3_key=%s)",
+                job_id, original_filename, language, active_size, media_type, s3_key)
 
     job_dir = os.path.join(settings.local_processing_dir, job_id)
     os.makedirs(job_dir, exist_ok=True)
 
     try:
-        s3_key = f"{job_id}/compressed.ogg"
-        audio_path = s3_client.download_file(
-            settings.s3_bucket, s3_key,
-            os.path.join(job_dir, "compressed.ogg"),
-        )
+        if s3_key:
+            redis_pubsub.publish_job_status(job_id, "downloading")
+            original_path = s3_client.download_file(
+                settings.s3_bucket, s3_key,
+                os.path.join(job_dir, "original"),
+            )
 
+            redis_pubsub.publish_job_status(job_id, "analyzing")
+            media_info = detect_media_type(original_path)
+            file_size = os.path.getsize(original_path)
+
+            if needs_conversion(media_info, file_size):
+                redis_pubsub.publish_job_status(job_id, "compressing")
+                compressed_path = os.path.join(job_dir, "compressed.ogg")
+                prepare_audio(original_path, compressed_path)
+                os.remove(original_path)
+                audio_path = compressed_path
+                detected_type = "video" if media_info["has_video"] else "audio"
+            else:
+                audio_path = original_path
+                detected_type = "audio"
+                # Rename to .ogg so split_audio works consistently
+                ogg_path = os.path.join(job_dir, "compressed.ogg")
+                os.rename(original_path, ogg_path)
+                audio_path = ogg_path
+
+            media_type = media_type or detected_type
+        else:
+            redis_pubsub.publish_job_status(job_id, "downloading")
+            s3_key = f"{job_id}/compressed.ogg"
+            audio_path = s3_client.download_file(
+                settings.s3_bucket, s3_key,
+                os.path.join(job_dir, "compressed.ogg"),
+            )
+
+        redis_pubsub.publish_job_status(job_id, "splitting")
         chunks = split_audio(audio_path, chunk_duration=settings.chunk_duration_seconds,
                              output_dir=job_dir)
 
         if len(chunks) == 1:
+            redis_pubsub.publish_job_status(job_id, "transcribing", chunks=1)
             model = get_model(model_size)
             chunk_path, _ = chunks[0]
             segments_list, info, processing_time = _run_transcription(model, chunk_path, language)
@@ -216,10 +280,16 @@ def process_media(self, job_id: str, original_filename: str = "",
             except Exception as e:
                 logger.warning("MongoDB save failed (non-fatal): %s", e)
 
+            redis_pubsub.publish_job_status(
+                job_id, "done",
+                duration=result["duration"],
+                segments=len(segments_list),
+            )
             logger.info("Done: %d segments, %.1fs", len(segments_list), result["duration"])
             return result
 
         logger.info("Dispatching chord of %d chunk tasks for job %s", len(chunks), job_id)
+        redis_pubsub.publish_job_status(job_id, "transcribing", chunks=len(chunks))
 
         subtasks = [
             transcribe_audio_chunk.s(
@@ -246,6 +316,12 @@ def process_media(self, job_id: str, original_filename: str = "",
         )
         raise Ignore()
 
+    except Ignore:
+        raise
+    except Exception as e:
+        _save_error_report(job_id, e, filename=original_filename, model_size=active_size)
+        redis_pubsub.publish_job_status(job_id, "failed", error=str(e))
+        raise
     finally:
         shutil.rmtree(job_dir, ignore_errors=True)
 
@@ -279,58 +355,72 @@ def merge_transcriptions(chunk_results: list, job_id: str,
                           media_type: str = "audio"):
     active_size = model_size or settings.model_size
 
-    chunk_results.sort(key=lambda r: r["offset"])
-
-    merged_segments = []
-    seen_end = -1.0
-
-    for chunk in chunk_results:
-        for seg in chunk["segments"]:
-            if seg["start"] >= seen_end - 0.5:
-                merged_segments.append(seg)
-                seen_end = max(seen_end, seg["end"])
-
-    total_duration  = merged_segments[-1]["end"] if merged_segments else 0.0
-    best_chunk      = max(chunk_results, key=lambda r: r["language_probability"])
-    total_audio     = sum(r["audio_duration"]    for r in chunk_results)
-    total_vad_cut   = sum(r["vad_removed_seconds"] for r in chunk_results)
-    total_proc      = sum(r["processing_time"]   for r in chunk_results)
-
-    merged_result = {
-        "language":             best_chunk["language"],
-        "language_probability": best_chunk["language_probability"],
-        "duration":             round(total_duration, 3),
-        "segments":             merged_segments,
-    }
-
-    result_key = f"{job_id}/transcription.json"
-    s3_client.upload_json(merged_result, settings.s3_bucket, result_key)
-
     try:
-        col = get_mongo()
-        col.insert_one({
-            "job_id":                  job_id,
-            "filename":                original_filename,
-            "model_size":              active_size,
-            "media_type":              media_type,
-            "language":                merged_result["language"],
-            "language_probability":    merged_result["language_probability"],
-            "audio_duration":          round(total_audio, 3),
-            "vad_removed_seconds":     round(total_vad_cut, 3),
-            "duration_after_vad":      round(total_audio - total_vad_cut, 3),
-            "processing_time_seconds": round(total_proc, 2),
-            "s3_result_key":           result_key,
-            "segments":                merged_segments,
-            "chunks":                  len(chunk_results),
-            "created_at":              datetime.datetime.utcnow(),
-        })
+        redis_pubsub.publish_job_status(job_id, "merging")
+
+        chunk_results.sort(key=lambda r: r["offset"])
+
+        merged_segments = []
+        seen_end = -1.0
+
+        for chunk in chunk_results:
+            for seg in chunk["segments"]:
+                if seg["start"] >= seen_end - 0.5:
+                    merged_segments.append(seg)
+                    seen_end = max(seen_end, seg["end"])
+
+        total_duration  = merged_segments[-1]["end"] if merged_segments else 0.0
+        best_chunk      = max(chunk_results, key=lambda r: r["language_probability"])
+        total_audio     = sum(r["audio_duration"]    for r in chunk_results)
+        total_vad_cut   = sum(r["vad_removed_seconds"] for r in chunk_results)
+        total_proc      = sum(r["processing_time"]   for r in chunk_results)
+
+        merged_result = {
+            "language":             best_chunk["language"],
+            "language_probability": best_chunk["language_probability"],
+            "duration":             round(total_duration, 3),
+            "segments":             merged_segments,
+        }
+
+        result_key = f"{job_id}/transcription.json"
+        s3_client.upload_json(merged_result, settings.s3_bucket, result_key)
+
+        try:
+            col = get_mongo()
+            col.insert_one({
+                "job_id":                  job_id,
+                "filename":                original_filename,
+                "model_size":              active_size,
+                "media_type":              media_type,
+                "language":                merged_result["language"],
+                "language_probability":    merged_result["language_probability"],
+                "audio_duration":          round(total_audio, 3),
+                "vad_removed_seconds":     round(total_vad_cut, 3),
+                "duration_after_vad":      round(total_audio - total_vad_cut, 3),
+                "processing_time_seconds": round(total_proc, 2),
+                "s3_result_key":           result_key,
+                "segments":                merged_segments,
+                "chunks":                  len(chunk_results),
+                "created_at":              datetime.datetime.utcnow(),
+            })
+        except Exception as e:
+            logger.warning("MongoDB save failed (non-fatal): %s", e)
+
+        celery_app.backend.store_result(job_id, merged_result, "SUCCESS")
+
+        redis_pubsub.publish_job_status(
+            job_id, "done",
+            duration=merged_result["duration"],
+            segments=len(merged_segments),
+        )
+
+        logger.info(
+            "Merge complete: job=%s, %d chunks, %d segments, %.1fs, proc=%.1fs",
+            job_id, len(chunk_results), len(merged_segments), total_duration, total_proc,
+        )
+        return merged_result
+
     except Exception as e:
-        logger.warning("MongoDB save failed (non-fatal): %s", e)
-
-    celery_app.backend.store_result(job_id, merged_result, "SUCCESS")
-
-    logger.info(
-        "Merge complete: job=%s, %d chunks, %d segments, %.1fs, proc=%.1fs",
-        job_id, len(chunk_results), len(merged_segments), total_duration, total_proc,
-    )
-    return merged_result
+        _save_error_report(job_id, e, filename=original_filename, model_size=active_size)
+        redis_pubsub.publish_job_status(job_id, "failed", error=str(e))
+        raise

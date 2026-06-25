@@ -29,7 +29,8 @@ def get_s3_client():
 def ensure_bucket():
     s3 = get_s3_client()
     bucket = settings.s3_bucket
-    for attempt in range(3):
+    max_attempts = 10
+    for attempt in range(max_attempts):
         try:
             s3.create_bucket(Bucket=bucket)
             logger.info("Created S3 bucket: %s", bucket)
@@ -39,9 +40,15 @@ def ensure_bucket():
             if code in ("BucketAlreadyOwnedByYou", "BucketAlreadyExists"):
                 logger.info("S3 bucket already exists: %s", bucket)
                 return
-            if attempt < 2:
-                logger.warning("Failed to create bucket (attempt %d/3): %s", attempt + 1, e)
-                time.sleep(2)
+            if attempt < max_attempts - 1:
+                logger.warning("Failed to create bucket (attempt %d/%d): %s", attempt + 1, max_attempts, e)
+                time.sleep(3)
+            else:
+                raise
+        except Exception as e:
+            if attempt < max_attempts - 1:
+                logger.warning("S3 not ready (attempt %d/%d): %s", attempt + 1, max_attempts, e)
+                time.sleep(3)
             else:
                 raise
 
@@ -67,6 +74,17 @@ def upload_json(data: dict, bucket: str, key: str) -> str:
     s3.put_object(Bucket=bucket, Key=key, Body=body, ContentType="application/json")
     logger.info("Uploaded JSON to s3://%s/%s (%.1fKB)", bucket, key, len(body) / 1024)
     return key
+
+
+def generate_presigned_url(bucket: str, key: str, expiration: int = 3600) -> str:
+    s3 = get_s3_client()
+    url = s3.generate_presigned_url(
+        ClientMethod="put_object",
+        Params={"Bucket": bucket, "Key": key},
+        ExpiresIn=expiration,
+    )
+    url = url.replace(settings.s3_endpoint_url, settings.s3_public_endpoint_url)
+    return url
 
 
 def delete_prefix(bucket: str, prefix: str):

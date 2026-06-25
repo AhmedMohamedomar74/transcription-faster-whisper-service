@@ -2,21 +2,23 @@ import os
 import json
 import uuid
 import shutil
-import subprocess
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.responses import JSONResponse
 from celery.result import AsyncResult
+from sse_starlette.sse import EventSourceResponse
 
 from pymongo import MongoClient
 
 from config import settings
-from schemas import JobStatus, TranscriptionResult
+from schemas import JobStatus, TranscriptionResult, UploadRequest, UploadResponse, TranscribeRequest
 from worker import celery_app, process_media
 from faster_whisper.utils import available_models
 import s3_client
+import redis_pubsub
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -33,46 +35,15 @@ def get_mongo():
     return _mongo_client["whisper"]["transcriptions"]
 
 
-def detect_media_type(file_path: str) -> dict:
-    result = subprocess.run(
-        ["ffprobe", "-v", "error",
-         "-show_entries", "stream=codec_type,codec_name",
-         "-of", "json", file_path],
-        capture_output=True, text=True, check=True,
-    )
-    data = json.loads(result.stdout)
-    has_video = False
-    audio_codec = None
-    for stream in data.get("streams", []):
-        if stream.get("codec_type") == "video":
-            has_video = True
-        if stream.get("codec_type") == "audio":
-            audio_codec = stream.get("codec_name")
-    return {"has_video": has_video, "audio_codec": audio_codec}
-
-
-def needs_conversion(media_info: dict, file_size: int) -> bool:
-    if media_info["has_video"]:
-        return True
-    if file_size > 10 * 1024 * 1024:
-        return True
-    if media_info.get("audio_codec") not in ("opus", "vorbis"):
-        return True
-    return False
-
-
-def prepare_audio(input_path: str, output_path: str) -> str:
-    subprocess.run(
-        ["ffmpeg", "-y", "-i", input_path,
-         "-vn",
-         "-ar", "16000",
-         "-ac", "1",
-         "-c:a", "libopus",
-         "-b:a", "32k",
-         output_path],
-        capture_output=True, check=True,
-    )
-    return output_path
+def _get_db_error(job_id: str) -> dict:
+    try:
+        col = get_mongo()
+        doc = col.find_one({"job_id": job_id}, {"_id": 0, "segments": 0})
+        if doc:
+            return doc
+    except Exception:
+        pass
+    return {}
 
 
 @asynccontextmanager
@@ -102,6 +73,8 @@ def get_queue_depth():
     total = sum(len(v) for v in active.values()) + sum(len(v) for v in reserved.values())
     return total
 
+
+# ── Legacy file-upload endpoint ──────────────────────────────────────
 
 @app.post("/transcribe/async")
 async def transcribe_async(
@@ -140,25 +113,16 @@ async def transcribe_async(
                     )
                 f.write(chunk)
 
-        media_info = detect_media_type(original_path)
+        s3_key = f"{job_id}/original{ext}"
+        s3_client.upload_file(original_path, settings.s3_bucket, s3_key)
 
-        if needs_conversion(media_info, total_read):
-            compressed_path = os.path.join(job_dir, "compressed.ogg")
-            prepare_audio(original_path, compressed_path)
-            upload_path = compressed_path
-        else:
-            upload_path = original_path
-
-        s3_key = f"{job_id}/compressed.ogg"
-        s3_client.upload_file(upload_path, settings.s3_bucket, s3_key)
-
-        task = process_media.apply_async(
+        process_media.apply_async(
             kwargs={
                 "job_id": job_id,
+                "s3_key": s3_key,
                 "original_filename": file.filename,
                 "language": language,
                 "model_size": model_size,
-                "media_type": "video" if media_info["has_video"] else "audio",
             },
             task_id=job_id,
         )
@@ -169,11 +133,60 @@ async def transcribe_async(
         shutil.rmtree(job_dir, ignore_errors=True)
 
 
+# ── New presigned-URL endpoints ──────────────────────────────────────
+
+@app.post("/upload/request", response_model=UploadResponse)
+async def request_upload(body: UploadRequest):
+    filename = body.filename
+    job_id = str(uuid.uuid4())
+    ext = os.path.splitext(filename)[1] or ".bin"
+    s3_key = f"{job_id}/original{ext}"
+    presigned_url = s3_client.generate_presigned_url(
+        settings.s3_bucket, s3_key,
+        expiration=settings.presigned_url_expiration_seconds,
+    )
+    return UploadResponse(
+        job_id=job_id,
+        s3_key=s3_key,
+        presigned_url=presigned_url,
+        expires_in=settings.presigned_url_expiration_seconds,
+    )
+
+
+@app.post("/transcribe")
+async def transcribe(body: TranscribeRequest):
+    if body.model_size and body.model_size not in available_models():
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown model '{body.model_size}'. Available: {available_models()}",
+        )
+    process_media.apply_async(
+        kwargs={
+            "job_id": body.job_id,
+            "s3_key": body.s3_key,
+            "original_filename": body.filename,
+            "language": body.language,
+            "model_size": body.model_size,
+        },
+        task_id=body.job_id,
+    )
+    return {"job_id": body.job_id}
+
+
+# ── Job status ───────────────────────────────────────────────────────
+
 @app.get("/jobs/{job_id}")
 async def get_job(job_id: str):
     task = AsyncResult(job_id, app=celery_app)
 
     if task.state == "PENDING":
+        db_doc = _get_db_error(job_id)
+        if db_doc and db_doc.get("error"):
+            return JobStatus(
+                job_id=job_id,
+                status="failed",
+                error=db_doc["error"],
+            ).model_dump()
         return JobStatus(
             job_id=job_id,
             status="pending",
@@ -199,20 +212,75 @@ async def get_job(job_id: str):
         ).model_dump()
 
     if task.state == "FAILURE":
+        db_doc = _get_db_error(job_id)
+        error_msg = str(task.info) if task.info else "Unknown error"
+        if db_doc.get("error"):
+            error_msg = db_doc["error"]
         return JobStatus(
             job_id=job_id,
             status="failed",
-            error=str(task.info) if task.info else "Unknown error",
+            error=error_msg,
         ).model_dump()
 
     return JobStatus(job_id=job_id, status=task.state.lower()).model_dump()
 
 
+# ── SSE streaming ────────────────────────────────────────────────────
+
+@app.get("/jobs/{job_id}/stream")
+async def job_stream(job_id: str, request: Request):
+    async def event_generator():
+        pubsub = None
+        try:
+            task = AsyncResult(job_id, app=celery_app)
+
+            if task.state == "SUCCESS":
+                yield {"event": "status", "data": json.dumps({"status": "done"})}
+                return
+            if task.state == "FAILURE":
+                yield {"event": "status", "data": json.dumps({"status": "failed", "error": str(task.info)})}
+                return
+
+            pubsub = redis_pubsub.subscribe_job_status(job_id)
+
+            task = AsyncResult(job_id, app=celery_app)
+            if task.state == "SUCCESS":
+                yield {"event": "status", "data": json.dumps({"status": "done"})}
+                return
+            if task.state == "FAILURE":
+                yield {"event": "status", "data": json.dumps({"status": "failed", "error": str(task.info)})}
+                return
+
+            while True:
+                if await request.is_disconnected():
+                    break
+
+                msg = pubsub.get_message(timeout=5.0)
+                if msg and msg["type"] == "message":
+                    data = json.loads(msg["data"])
+                    yield {"event": "status", "data": json.dumps(data)}
+                    if data.get("status") in ("done", "failed"):
+                        return
+                else:
+                    yield {"event": "ping", "data": ""}
+
+        finally:
+            if pubsub:
+                try:
+                    pubsub.unsubscribe()
+                    pubsub.close()
+                except Exception:
+                    pass
+
+    return EventSourceResponse(event_generator())
+
+
+# ── Health & Readiness ──────────────────────────────────────────────
+
 @app.get("/health")
 async def health():
     queue_depth = get_queue_depth()
     alive = worker_alive()
-
     return {
         "status": "alive",
         "model_loaded": alive,
@@ -240,6 +308,8 @@ async def models():
         "loaded": list(_models.keys()),
     }
 
+
+# ── MongoDB Transcription History ────────────────────────────────────
 
 @app.get("/transcriptions")
 async def list_transcriptions(

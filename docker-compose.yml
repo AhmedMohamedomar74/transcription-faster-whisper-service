@@ -9,10 +9,14 @@ services:
     volumes:
       - model_cache:/root/.cache/huggingface
     depends_on:
-      - redis
-      - mongo
-      - seaweedfs
+      redis:
+        condition: service_started
+      mongo:
+        condition: service_started
+      seaweedfs:
+        condition: service_healthy
     mem_limit: 2g
+    cpus: 2
 
   worker:
     build: .
@@ -23,10 +27,14 @@ services:
     volumes:
       - model_cache:/root/.cache/huggingface
     depends_on:
-      - redis
-      - mongo
-      - seaweedfs
+      redis:
+        condition: service_started
+      mongo:
+        condition: service_started
+      seaweedfs:
+        condition: service_healthy
     mem_limit: 4g
+    cpus: 2
 
   seaweedfs:
     image: chrislusf/seaweedfs:latest
@@ -36,6 +44,12 @@ services:
     volumes:
       - /mnt/mnt2/Simple/faster-whisper/service/.seaweedfs_data:/data
     mem_limit: 1g
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8333"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
 
   redis:
     image: redis:7-alpine
