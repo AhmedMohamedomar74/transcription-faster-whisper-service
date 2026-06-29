@@ -59,7 +59,7 @@ jobs:
             docker network create shared 2>/dev/null || true
 
             # Snapshot current image for rollback
-            CONTAINER_ID=$(docker compose -f docker-compose.prod.yml ps -q whisper-api 2>/dev/null | head -1)
+            CONTAINER_ID=$(docker compose -f docker-compose.prod.yml ps -q api 2>/dev/null | head -1)
             PREV_IMAGE=""
             if [ -n "$CONTAINER_ID" ]; then
               PREV_IMAGE=$(docker inspect --format='{{.Image}}' "$CONTAINER_ID" 2>/dev/null)
@@ -77,13 +77,13 @@ jobs:
             echo "IMAGE_NAME=${IMAGE_NAME}" >> .env
 
             # Pull and deploy
-            docker compose -f docker-compose.prod.yml pull whisper-api whisper-worker
+            docker compose -f docker-compose.prod.yml pull api worker
             docker compose -f docker-compose.prod.yml --env-file .env up -d --no-build
 
             # Health check
             sleep 15
             for i in $(seq 1 30); do
-              HTTP_CODE=$(docker compose -f docker-compose.prod.yml exec -T whisper-api curl -sf -o /dev/null -w "%{http_code}" http://localhost:8000/health 2>/dev/null || true)
+              HTTP_CODE=$(docker compose -f docker-compose.prod.yml exec -T api curl -sf -o /dev/null -w "%{http_code}" http://localhost:8000/health 2>/dev/null || true)
               if [ "$HTTP_CODE" = "200" ]; then
                 echo "Health check passed on attempt $i"
                 exit 0
@@ -96,7 +96,7 @@ jobs:
             echo "Health check failed — rolling back..."
             if [ -n "$PREV_IMAGE" ]; then
               docker tag "$PREV_IMAGE" ghcr.io/${IMAGE_NAME}:latest
-              docker compose -f docker-compose.prod.yml --env-file .env up -d --no-build whisper-api whisper-worker
+              docker compose -f docker-compose.prod.yml --env-file .env up -d --no-build api worker
               echo "Rolled back to $PREV_IMAGE"
             else
               echo "No previous image — cannot rollback"

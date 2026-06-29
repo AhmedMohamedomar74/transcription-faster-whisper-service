@@ -1,17 +1,17 @@
 version: "3.9"
 
 services:
-  whisper-api:
+  api:
     image: ${REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG:-latest}
     env_file: .env
     volumes:
       - model_cache:/root/.cache/huggingface
     depends_on:
-      whisper-redis:
+      redis:
         condition: service_started
-      whisper-mongo:
+      mongo:
         condition: service_started
-      whisper-seaweedfs:
+      seaweedfs:
         condition: service_healthy
     mem_limit: 2g
     cpus: 2
@@ -19,7 +19,7 @@ services:
     networks:
       - shared
 
-  whisper-worker:
+  worker:
     image: ${REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG:-latest}
     command: celery -A worker worker --concurrency=1 --prefetch-multiplier=1 --loglevel=info
     env_file: .env
@@ -28,11 +28,11 @@ services:
     volumes:
       - model_cache:/root/.cache/huggingface
     depends_on:
-      whisper-redis:
+      redis:
         condition: service_started
-      whisper-mongo:
+      mongo:
         condition: service_started
-      whisper-seaweedfs:
+      seaweedfs:
         condition: service_healthy
     mem_limit: 4g
     cpus: 2
@@ -40,7 +40,7 @@ services:
     networks:
       - shared
 
-  whisper-seaweedfs:
+  seaweedfs:
     image: chrislusf/seaweedfs:latest
     command: "server -s3 -s3.port=8333 -dir=/data"
     volumes:
@@ -56,7 +56,7 @@ services:
     networks:
       - shared
 
-  whisper-redis:
+  redis:
     image: redis:7-alpine
     volumes:
       - redis_data:/data
@@ -64,7 +64,7 @@ services:
     networks:
       - shared
 
-  whisper-mongo:
+  mongo:
     image: mongo:7
     volumes:
       - mongo_data:/data/db
