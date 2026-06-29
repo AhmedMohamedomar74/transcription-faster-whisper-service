@@ -15,20 +15,30 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - name: Encode .env for safe transfer
+        id: encode
+        run: echo "env_b64=$(echo '${{ secrets.APP_ENV_FILE }}' | base64 -w 0)" >> "$GITHUB_OUTPUT"
+
       - name: Deploy via SSH
         uses: appleboy/ssh-action@v1
+        env:
+          ENV_B64: ${{ steps.encode.outputs.env_b64 }}
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+          REPO: ${{ github.repository }}
+          ACTOR: ${{ github.actor }}
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_KEY }}
+          envs: ENV_B64,IMAGE_TAG,GH_TOKEN,DEPLOY_PATH,REPO,ACTOR
           script: |
-            # Derive lowercase image name
-            IMAGE_NAME=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+            IMAGE_NAME=$(echo "$REPO" | tr '[:upper:]' '[:lower:]')
 
-            # Login to GHCR
-            echo "${{ secrets.GH_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+            echo "$GH_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
 
-            cd ${{ secrets.DEPLOY_PATH }}
+            cd "$DEPLOY_PATH"
 
             # Snapshot current image for rollback
             CONTAINER_ID=$(docker compose -f docker-compose.prod.yml ps -q whisper-api 2>/dev/null | head -1)
@@ -40,10 +50,10 @@ jobs:
               echo "No running container — first deployment"
             fi
 
-            # Write .env
-            printf '%s\n' '${{ secrets.APP_ENV_FILE }}' > .env
-            echo "IMAGE_TAG=${{ inputs.image_tag }}" >> .env
-            echo "REGISTRY=${{ env.REGISTRY }}" >> .env
+            # Decode .env safely
+            echo "$ENV_B64" | base64 -d > .env
+            echo "IMAGE_TAG=${IMAGE_TAG}" >> .env
+            echo "REGISTRY=ghcr.io" >> .env
             echo "IMAGE_NAME=${IMAGE_NAME}" >> .env
 
             # Pull and deploy
@@ -65,7 +75,7 @@ jobs:
             # Rollback
             echo "Health check failed — rolling back..."
             if [ -n "$PREV_IMAGE" ]; then
-              docker tag "$PREV_IMAGE" ${{ env.REGISTRY }}/${IMAGE_NAME}:latest
+              docker tag "$PREV_IMAGE" ghcr.io/${IMAGE_NAME}:latest
               docker compose -f docker-compose.prod.yml --env-file .env up -d --no-build whisper-api whisper-worker
               echo "Rolled back to $PREV_IMAGE"
             else
