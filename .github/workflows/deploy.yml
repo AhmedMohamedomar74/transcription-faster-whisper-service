@@ -17,7 +17,11 @@ jobs:
     steps:
       - name: Encode .env for safe transfer
         id: encode
-        run: echo "env_b64=$(echo '${{ secrets.APP_ENV_FILE }}' | base64 -w 0)" >> "$GITHUB_OUTPUT"
+        env:
+          RAW_ENV: ${{ secrets.APP_ENV_FILE }}
+        run: |
+          ENV_B64=$(printf '%s' "$RAW_ENV" | base64 -w 0)
+          echo "env_b64=${ENV_B64}" >> "$GITHUB_OUTPUT"
 
       - name: Deploy via SSH
         uses: appleboy/ssh-action@v1
