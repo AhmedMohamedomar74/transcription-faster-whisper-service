@@ -76,6 +76,9 @@ jobs:
             echo "REGISTRY=ghcr.io" >> .env
             echo "IMAGE_NAME=${IMAGE_NAME}" >> .env
 
+            # Stop old containers (clean state)
+            docker compose -f docker-compose.prod.yml down --remove-orphans 2>/dev/null || true
+
             # Pull and deploy
             docker compose -f docker-compose.prod.yml pull api worker
             docker compose -f docker-compose.prod.yml --env-file .env up -d --no-build
