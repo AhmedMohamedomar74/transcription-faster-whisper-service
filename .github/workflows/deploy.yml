@@ -9,7 +9,6 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}/transcription
 
 jobs:
   deploy:
@@ -23,6 +22,9 @@ jobs:
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_KEY }}
           script: |
+            # Derive lowercase image name
+            IMAGE_NAME=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+
             # Login to GHCR
             echo "${{ secrets.GH_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
 
@@ -42,7 +44,7 @@ jobs:
             printf '%s\n' '${{ secrets.APP_ENV_FILE }}' > .env
             echo "IMAGE_TAG=${{ inputs.image_tag }}" >> .env
             echo "REGISTRY=${{ env.REGISTRY }}" >> .env
-            echo "IMAGE_NAME=${{ env.IMAGE_NAME }}" >> .env
+            echo "IMAGE_NAME=${IMAGE_NAME}" >> .env
 
             # Pull and deploy
             docker compose -f docker-compose.prod.yml pull whisper-api whisper-worker
@@ -63,7 +65,7 @@ jobs:
             # Rollback
             echo "Health check failed — rolling back..."
             if [ -n "$PREV_IMAGE" ]; then
-              docker tag "$PREV_IMAGE" ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+              docker tag "$PREV_IMAGE" ${{ env.REGISTRY }}/${IMAGE_NAME}:latest
               docker compose -f docker-compose.prod.yml --env-file .env up -d --no-build whisper-api whisper-worker
               echo "Rolled back to $PREV_IMAGE"
             else
