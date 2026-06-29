@@ -29,7 +29,7 @@ def get_s3_client():
 def ensure_bucket():
     s3 = get_s3_client()
     bucket = settings.s3_bucket
-    max_attempts = 10
+    max_attempts = 30
     for attempt in range(max_attempts):
         try:
             s3.create_bucket(Bucket=bucket)
