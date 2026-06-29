@@ -70,6 +70,8 @@ jobs:
 
             # Decode .env safely
             echo "$ENV_B64" | base64 -d > .env
+            # Ensure trailing newline before appending
+            sed -i -e '$a\' .env
             echo "IMAGE_TAG=${IMAGE_TAG}" >> .env
             echo "REGISTRY=ghcr.io" >> .env
             echo "IMAGE_NAME=${IMAGE_NAME}" >> .env
