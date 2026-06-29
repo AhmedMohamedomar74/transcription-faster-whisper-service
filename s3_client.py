@@ -1,7 +1,7 @@
 import json
+import logging
 import os
 import time
-import logging
 
 import boto3
 from botocore.exceptions import ClientError
@@ -41,13 +41,20 @@ def ensure_bucket():
                 logger.info("S3 bucket already exists: %s", bucket)
                 return
             if attempt < max_attempts - 1:
-                logger.warning("Failed to create bucket (attempt %d/%d): %s", attempt + 1, max_attempts, e)
+                logger.warning(
+                    "Failed to create bucket (attempt %d/%d): %s",
+                    attempt + 1,
+                    max_attempts,
+                    e,
+                )
                 time.sleep(3)
             else:
                 raise
         except Exception as e:
             if attempt < max_attempts - 1:
-                logger.warning("S3 not ready (attempt %d/%d): %s", attempt + 1, max_attempts, e)
+                logger.warning(
+                    "S3 not ready (attempt %d/%d): %s", attempt + 1, max_attempts, e
+                )
                 time.sleep(3)
             else:
                 raise
@@ -56,7 +63,12 @@ def ensure_bucket():
 def upload_file(local_path: str, bucket: str, key: str) -> str:
     s3 = get_s3_client()
     s3.upload_file(local_path, bucket, key)
-    logger.info("Uploaded to s3://%s/%s (%.1fMB)", bucket, key, os.path.getsize(local_path) / 1024 / 1024)
+    logger.info(
+        "Uploaded to s3://%s/%s (%.1fMB)",
+        bucket,
+        key,
+        os.path.getsize(local_path) / 1024 / 1024,
+    )
     return key
 
 
@@ -97,4 +109,6 @@ def delete_prefix(bucket: str, prefix: str):
             delete_keys.append({"Key": obj["Key"]})
     if delete_keys:
         s3.delete_objects(Bucket=bucket, Delete={"Objects": delete_keys})
-        logger.info("Deleted %d objects under s3://%s/%s", len(delete_keys), bucket, prefix)
+        logger.info(
+            "Deleted %d objects under s3://%s/%s", len(delete_keys), bucket, prefix
+        )

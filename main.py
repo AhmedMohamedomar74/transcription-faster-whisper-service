@@ -1,24 +1,28 @@
-import os
 import json
-import uuid
-import shutil
-import asyncio
 import logging
+import os
+import shutil
+import uuid
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
-from fastapi.responses import JSONResponse
 from celery.result import AsyncResult
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import JSONResponse
+from faster_whisper.utils import available_models
+from pymongo import MongoClient
 from sse_starlette.sse import EventSourceResponse
 
-from pymongo import MongoClient
-
-from config import settings
-from schemas import JobStatus, TranscriptionResult, UploadRequest, UploadResponse, TranscribeRequest
-from worker import celery_app, process_media
-from faster_whisper.utils import available_models
-import s3_client
 import redis_pubsub
+import s3_client
+from config import settings
+from schemas import (
+    JobStatus,
+    TranscribeRequest,
+    TranscriptionResult,
+    UploadRequest,
+    UploadResponse,
+)
+from worker import celery_app, process_media
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -50,7 +54,9 @@ def _get_db_error(job_id: str) -> dict:
 async def lifespan(app: FastAPI):
     os.makedirs(settings.local_processing_dir, exist_ok=True)
     s3_client.ensure_bucket()
-    logger.info("Starting API (model_size=%s, device=%s)", settings.model_size, settings.device)
+    logger.info(
+        "Starting API (model_size=%s, device=%s)", settings.model_size, settings.device
+    )
     yield
     logger.info("Shutting down API")
 
@@ -70,11 +76,14 @@ def get_queue_depth():
     insp = celery_app.control.inspect(timeout=2)
     active = insp.active() or {}
     reserved = insp.reserved() or {}
-    total = sum(len(v) for v in active.values()) + sum(len(v) for v in reserved.values())
+    total = sum(len(v) for v in active.values()) + sum(
+        len(v) for v in reserved.values()
+    )
     return total
 
 
 # ── Legacy file-upload endpoint ──────────────────────────────────────
+
 
 @app.post("/transcribe/async")
 async def transcribe_async(
@@ -135,6 +144,7 @@ async def transcribe_async(
 
 # ── New presigned-URL endpoints ──────────────────────────────────────
 
+
 @app.post("/upload/request", response_model=UploadResponse)
 async def request_upload(body: UploadRequest):
     filename = body.filename
@@ -142,7 +152,8 @@ async def request_upload(body: UploadRequest):
     ext = os.path.splitext(filename)[1] or ".bin"
     s3_key = f"{job_id}/original{ext}"
     presigned_url = s3_client.generate_presigned_url(
-        settings.s3_bucket, s3_key,
+        settings.s3_bucket,
+        s3_key,
         expiration=settings.presigned_url_expiration_seconds,
     )
     return UploadResponse(
@@ -158,7 +169,8 @@ async def transcribe(body: TranscribeRequest):
     if body.model_size and body.model_size not in available_models():
         raise HTTPException(
             status_code=400,
-            detail=f"Unknown model '{body.model_size}'. Available: {available_models()}",
+            detail=f"Unknown model '{body.model_size}'. "
+            f"Available: {available_models()}",
         )
     process_media.apply_async(
         kwargs={
@@ -174,6 +186,7 @@ async def transcribe(body: TranscribeRequest):
 
 
 # ── Job status ───────────────────────────────────────────────────────
+
 
 @app.get("/jobs/{job_id}")
 async def get_job(job_id: str):
@@ -227,6 +240,7 @@ async def get_job(job_id: str):
 
 # ── SSE streaming ────────────────────────────────────────────────────
 
+
 @app.get("/jobs/{job_id}/stream")
 async def job_stream(job_id: str, request: Request):
     async def event_generator():
@@ -238,7 +252,10 @@ async def job_stream(job_id: str, request: Request):
                 yield {"event": "status", "data": json.dumps({"status": "done"})}
                 return
             if task.state == "FAILURE":
-                yield {"event": "status", "data": json.dumps({"status": "failed", "error": str(task.info)})}
+                yield {
+                    "event": "status",
+                    "data": json.dumps({"status": "failed", "error": str(task.info)}),
+                }
                 return
 
             pubsub = redis_pubsub.subscribe_job_status(job_id)
@@ -248,7 +265,10 @@ async def job_stream(job_id: str, request: Request):
                 yield {"event": "status", "data": json.dumps({"status": "done"})}
                 return
             if task.state == "FAILURE":
-                yield {"event": "status", "data": json.dumps({"status": "failed", "error": str(task.info)})}
+                yield {
+                    "event": "status",
+                    "data": json.dumps({"status": "failed", "error": str(task.info)}),
+                }
                 return
 
             while True:
@@ -277,6 +297,7 @@ async def job_stream(job_id: str, request: Request):
 
 # ── Health & Readiness ──────────────────────────────────────────────
 
+
 @app.get("/health")
 async def health():
     queue_depth = get_queue_depth()
@@ -301,6 +322,7 @@ async def ready():
 @app.get("/models")
 async def models():
     from worker import _models
+
     all_models = available_models()
     return {
         "available": all_models,
@@ -310,6 +332,7 @@ async def models():
 
 
 # ── MongoDB Transcription History ────────────────────────────────────
+
 
 @app.get("/transcriptions")
 async def list_transcriptions(
@@ -326,9 +349,9 @@ async def list_transcriptions(
         query["model_size"] = model_size
     docs = list(
         col.find(query, {"_id": 0, "segments": 0})
-           .sort("created_at", -1)
-           .skip(skip)
-           .limit(min(limit, 100))
+        .sort("created_at", -1)
+        .skip(skip)
+        .limit(min(limit, 100))
     )
     total = col.count_documents(query)
     return {"total": total, "skip": skip, "limit": limit, "items": docs}
@@ -337,7 +360,18 @@ async def list_transcriptions(
 @app.get("/transcriptions/stats")
 async def transcription_stats():
     col = get_mongo()
-    docs = list(col.find({}, {"_id": 0, "audio_duration": 1, "processing_time_seconds": 1, "model_size": 1, "language": 1}))
+    docs = list(
+        col.find(
+            {},
+            {
+                "_id": 0,
+                "audio_duration": 1,
+                "processing_time_seconds": 1,
+                "model_size": 1,
+                "language": 1,
+            },
+        )
+    )
     if not docs:
         return {"total_jobs": 0}
     total_audio = sum(d.get("audio_duration", 0) for d in docs)
@@ -345,12 +379,18 @@ async def transcription_stats():
     by_model = {}
     by_language = {}
     for d in docs:
-        by_model[d.get("model_size", "unknown")] = by_model.get(d.get("model_size", "unknown"), 0) + 1
-        by_language[d.get("language", "unknown")] = by_language.get(d.get("language", "unknown"), 0) + 1
+        by_model[d.get("model_size", "unknown")] = (
+            by_model.get(d.get("model_size", "unknown"), 0) + 1
+        )
+        by_language[d.get("language", "unknown")] = (
+            by_language.get(d.get("language", "unknown"), 0) + 1
+        )
     return {
         "total_jobs": len(docs),
         "total_audio_hours": round(total_audio / 3600, 3),
-        "avg_processing_ratio": round(total_proc / total_audio, 3) if total_audio else 0,
+        "avg_processing_ratio": round(total_proc / total_audio, 3)
+        if total_audio
+        else 0,
         "by_model": by_model,
         "by_language": by_language,
     }
@@ -361,11 +401,10 @@ async def compare_transcriptions(job_ids: str):
     col = get_mongo()
     ids = [j.strip() for j in job_ids.split(",") if j.strip()]
     if not ids:
-        raise HTTPException(status_code=400, detail="Provide at least one job_id in ?job_ids=id1,id2")
-    docs = list(col.find(
-        {"job_id": {"$in": ids}},
-        {"_id": 0, "segments": 0}
-    ))
+        raise HTTPException(
+            status_code=400, detail="Provide at least one job_id in ?job_ids=id1,id2"
+        )
+    docs = list(col.find({"job_id": {"$in": ids}}, {"_id": 0, "segments": 0}))
     return {"jobs": docs}
 
 

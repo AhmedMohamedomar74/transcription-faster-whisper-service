@@ -1,0 +1,72 @@
+name: Deploy
+
+on:
+  workflow_call:
+    inputs:
+      image_tag:
+        required: true
+        type: string
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}/transcription
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          script: |
+            # Login to GHCR
+            echo "${{ secrets.GH_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+            cd ${{ secrets.DEPLOY_PATH }}
+
+            # Snapshot current image for rollback
+            CONTAINER_ID=$(docker compose -f docker-compose.prod.yml ps -q whisper-api 2>/dev/null | head -1)
+            PREV_IMAGE=""
+            if [ -n "$CONTAINER_ID" ]; then
+              PREV_IMAGE=$(docker inspect --format='{{.Image}}' "$CONTAINER_ID" 2>/dev/null)
+              echo "Snapshotted: $PREV_IMAGE"
+            else
+              echo "No running container — first deployment"
+            fi
+
+            # Write .env
+            printf '%s\n' '${{ secrets.APP_ENV_FILE }}' > .env
+            echo "IMAGE_TAG=${{ inputs.image_tag }}" >> .env
+            echo "REGISTRY=${{ env.REGISTRY }}" >> .env
+            echo "IMAGE_NAME=${{ env.IMAGE_NAME }}" >> .env
+
+            # Pull and deploy
+            docker compose -f docker-compose.prod.yml pull whisper-api whisper-worker
+            docker compose -f docker-compose.prod.yml --env-file .env up -d --no-build
+
+            # Health check
+            sleep 15
+            for i in $(seq 1 30); do
+              HTTP_CODE=$(docker compose -f docker-compose.prod.yml exec -T whisper-api curl -sf -o /dev/null -w "%{http_code}" http://localhost:8000/health 2>/dev/null || true)
+              if [ "$HTTP_CODE" = "200" ]; then
+                echo "Health check passed on attempt $i"
+                exit 0
+              fi
+              echo "Attempt $i/30 (HTTP $HTTP_CODE) — waiting 10s..."
+              sleep 10
+            done
+
+            # Rollback
+            echo "Health check failed — rolling back..."
+            if [ -n "$PREV_IMAGE" ]; then
+              docker tag "$PREV_IMAGE" ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+              docker compose -f docker-compose.prod.yml --env-file .env up -d --no-build whisper-api whisper-worker
+              echo "Rolled back to $PREV_IMAGE"
+            else
+              echo "No previous image — cannot rollback"
+            fi
+            exit 1

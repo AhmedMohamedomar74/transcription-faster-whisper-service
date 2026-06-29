@@ -4,10 +4,19 @@ import subprocess
 
 def detect_media_type(file_path: str) -> dict:
     result = subprocess.run(
-        ["ffprobe", "-v", "error",
-         "-show_entries", "stream=codec_type,codec_name",
-         "-of", "json", file_path],
-        capture_output=True, text=True, check=True,
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=codec_type,codec_name",
+            "-of",
+            "json",
+            file_path,
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
     )
     data = json.loads(result.stdout)
     has_video = False
@@ -32,13 +41,23 @@ def needs_conversion(media_info: dict, file_size: int) -> bool:
 
 def prepare_audio(input_path: str, output_path: str) -> str:
     subprocess.run(
-        ["ffmpeg", "-y", "-i", input_path,
-         "-vn",
-         "-ar", "16000",
-         "-ac", "1",
-         "-c:a", "libopus",
-         "-b:a", "32k",
-         output_path],
-        capture_output=True, check=True,
+        [
+            "ffmpeg",
+            "-y",
+            "-i",
+            input_path,
+            "-vn",
+            "-ar",
+            "16000",
+            "-ac",
+            "1",
+            "-c:a",
+            "libopus",
+            "-b:a",
+            "32k",
+            output_path,
+        ],
+        capture_output=True,
+        check=True,
     )
     return output_path

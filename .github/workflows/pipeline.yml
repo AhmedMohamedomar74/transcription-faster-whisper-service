@@ -1,0 +1,33 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "*.py"
+      - "requirements.txt"
+      - "Dockerfile"
+      - ".github/workflows/**"
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    needs: [ci]
+    if: github.event_name != 'pull_request'
+    uses: ./.github/workflows/build.yml
+    permissions:
+      packages: write
+      contents: read
+
+  deploy:
+    needs: [build]
+    if: github.event_name != 'pull_request'
+    uses: ./.github/workflows/deploy.yml
+    with:
+      image_tag: ${{ needs.build.outputs.image_tag }}
+    secrets: inherit

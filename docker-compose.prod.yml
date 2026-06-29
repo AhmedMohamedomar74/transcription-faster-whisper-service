@@ -1,0 +1,84 @@
+version: "3.9"
+
+services:
+  whisper-api:
+    image: ${REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG:-latest}
+    env_file: .env
+    volumes:
+      - model_cache:/root/.cache/huggingface
+    depends_on:
+      whisper-redis:
+        condition: service_started
+      whisper-mongo:
+        condition: service_started
+      whisper-seaweedfs:
+        condition: service_healthy
+    mem_limit: 2g
+    cpus: 2
+    restart: unless-stopped
+    networks:
+      - shared
+
+  whisper-worker:
+    image: ${REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG:-latest}
+    command: celery -A worker worker --concurrency=1 --prefetch-multiplier=1 --loglevel=info
+    env_file: .env
+    environment:
+      - OMP_NUM_THREADS=2
+    volumes:
+      - model_cache:/root/.cache/huggingface
+    depends_on:
+      whisper-redis:
+        condition: service_started
+      whisper-mongo:
+        condition: service_started
+      whisper-seaweedfs:
+        condition: service_healthy
+    mem_limit: 4g
+    cpus: 2
+    restart: unless-stopped
+    networks:
+      - shared
+
+  whisper-seaweedfs:
+    image: chrislusf/seaweedfs:latest
+    command: "server -s3 -s3.port=8333 -dir=/data"
+    volumes:
+      - seaweed_data:/data
+    mem_limit: 1g
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8333"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    networks:
+      - shared
+
+  whisper-redis:
+    image: redis:7-alpine
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    networks:
+      - shared
+
+  whisper-mongo:
+    image: mongo:7
+    volumes:
+      - mongo_data:/data/db
+    mem_limit: 512m
+    restart: unless-stopped
+    networks:
+      - shared
+
+networks:
+  shared:
+    external: true
+
+volumes:
+  seaweed_data:
+  model_cache:
+  redis_data:
+  mongo_data:
