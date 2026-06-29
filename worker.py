@@ -346,9 +346,7 @@ def process_media(
             )
             return result
 
-        logger.info(
-            "Dispatching chord of %d chunk tasks for job %s", len(chunks), job_id
-        )
+        logger.info("Dispatching chord of %d chunk tasks for job %s", len(chunks), job_id)
         redis_pubsub.publish_job_status(job_id, "transcribing", chunks=len(chunks))
 
         subtasks = [
@@ -379,9 +377,7 @@ def process_media(
     except Ignore:
         raise
     except Exception as e:
-        _save_error_report(
-            job_id, e, filename=original_filename, model_size=active_size
-        )
+        _save_error_report(job_id, e, filename=original_filename, model_size=active_size)
         redis_pubsub.publish_job_status(job_id, "failed", error=str(e))
         raise
     finally:
@@ -501,8 +497,6 @@ def merge_transcriptions(
         return merged_result
 
     except Exception as e:
-        _save_error_report(
-            job_id, e, filename=original_filename, model_size=active_size
-        )
+        _save_error_report(job_id, e, filename=original_filename, model_size=active_size)
         redis_pubsub.publish_job_status(job_id, "failed", error=str(e))
         raise

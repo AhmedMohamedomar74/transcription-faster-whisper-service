@@ -24,6 +24,7 @@ dev = [
 
 [tool.black]
 line-length = 90
+target-version = ["py311"]
 
 [tool.isort]
 profile = "black"

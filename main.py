@@ -76,9 +76,7 @@ def get_queue_depth():
     insp = celery_app.control.inspect(timeout=2)
     active = insp.active() or {}
     reserved = insp.reserved() or {}
-    total = sum(len(v) for v in active.values()) + sum(
-        len(v) for v in reserved.values()
-    )
+    total = sum(len(v) for v in active.values()) + sum(len(v) for v in reserved.values())
     return total
 
 
@@ -388,9 +386,7 @@ async def transcription_stats():
     return {
         "total_jobs": len(docs),
         "total_audio_hours": round(total_audio / 3600, 3),
-        "avg_processing_ratio": round(total_proc / total_audio, 3)
-        if total_audio
-        else 0,
+        "avg_processing_ratio": round(total_proc / total_audio, 3) if total_audio else 0,
         "by_model": by_model,
         "by_language": by_language,
     }
