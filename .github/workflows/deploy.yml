@@ -15,6 +15,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - uses: actions/checkout@v4
+
       - name: Encode .env for safe transfer
         id: encode
         env:
@@ -22,6 +24,15 @@ jobs:
         run: |
           ENV_B64=$(printf '%s' "$RAW_ENV" | base64 -w 0)
           echo "env_b64=${ENV_B64}" >> "$GITHUB_OUTPUT"
+
+      - name: Copy docker-compose.prod.yml to server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          source: docker-compose.prod.yml
+          target: ${{ secrets.DEPLOY_PATH }}
 
       - name: Deploy via SSH
         uses: appleboy/ssh-action@v1
@@ -43,6 +54,9 @@ jobs:
             echo "$GH_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
 
             cd "$DEPLOY_PATH"
+
+            # Ensure shared network exists
+            docker network create shared 2>/dev/null || true
 
             # Snapshot current image for rollback
             CONTAINER_ID=$(docker compose -f docker-compose.prod.yml ps -q whisper-api 2>/dev/null | head -1)
